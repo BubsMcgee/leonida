@@ -81,7 +81,16 @@ public:
         return {limit_, started_, batches_, jobs_, running_};
     }
 
+    // Runs once at the start of each worker thread, before it takes a job. The host sets it to raise the workers'
+    // priority (LEONIDA_PIPELINE_PRIORITY) so a driver's compiler is not starved by the title's threads, without this
+    // header needing a platform header (windows.h's `small`/`min`/`max` macros break callers). Empty by default.
+    static void set_thread_start(std::function<void()> hook) { thread_start() = std::move(hook); }
+
 private:
+    static std::function<void()>& thread_start() {
+        static std::function<void()> hook;
+        return hook;
+    }
     struct Batch {  // on the stack of the run() that made it; guarded by mutex_
         const std::function<void(std::size_t)>* job;
         std::size_t count;
@@ -106,6 +115,7 @@ private:
     }
 
     void work() {
+        if (std::function<void()>& hook = thread_start()) hook();
         std::unique_lock lock(mutex_);
         for (;;) {
             work_.wait(lock, [this] { return stopping_ || !queue_.empty(); });

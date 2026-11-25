@@ -110,6 +110,22 @@
 namespace rt::d3d12 {
 namespace {
 
+// LEONIDA_PIPELINE_PRIORITY (above, high, below, low): the compile pool's workers run at that priority so the
+// driver's compiler keeps up while a submission's pipelines are built instead of being starved by the title's threads
+// (the Radeon runtime's VICTORY_PIPELINE_PRIORITY=above finding). Installed once; normal when unset.
+[[maybe_unused]] const bool g_pipeline_worker_priority = [] {
+    leonida::PipelineWorkers::set_thread_start([] {
+        const char* text = std::getenv("LEONIDA_PIPELINE_PRIORITY");
+        int priority = THREAD_PRIORITY_NORMAL;
+        if (text && !std::strcmp(text, "above")) priority = THREAD_PRIORITY_ABOVE_NORMAL;
+        else if (text && !std::strcmp(text, "high")) priority = THREAD_PRIORITY_HIGHEST;
+        else if (text && !std::strcmp(text, "below")) priority = THREAD_PRIORITY_BELOW_NORMAL;
+        else if (text && !std::strcmp(text, "low")) priority = THREAD_PRIORITY_LOWEST;
+        if (priority != THREAD_PRIORITY_NORMAL) SetThreadPriority(GetCurrentThread(), priority);
+    });
+    return true;
+}();
+
 // Every descriptor slot is this many bytes; an RTV or DSV slot holds a leonida::TargetView. The console's own
 // increments are open question 4 in docs/d3d12_vulkan.md; the application reads them from the device, as it must.
 constexpr UINT kDescriptorSize = descriptor_size;
