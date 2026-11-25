@@ -309,6 +309,36 @@ inline std::optional<std::array<TargetBlend, 8>> d3d12_blend(const BlendRegister
     return out;
 }
 
+// The integer-target blend bypass of the console stream (D3D-INTEGER-TARGET-BLEND-BYPASS): a console pipeline can
+// arrive with blending enabled on a target that holds an integer format, which RDNA2 handles by not blending it and
+// D3D12 refuses. `targets` is the stream's blend state, `independent` its IndependentBlendEnable, `count` its
+// NumRenderTargets and `formats` its DXGI formats. A state with no integer target is left exactly as it arrived.
+// Without independent blending the console shares target 0's state with every target, so it is copied out first
+// (keeping the shared write mask on all of them) and independence is turned on only when more than one target
+// follows; a shared state with blending already off needs neither. Then each integer target keeps its mask and has
+// blending off. Returns how many targets had an enable bit cleared (0 when nothing changed). Source: VIctory
+// (Marvisak/DexNom), commit ddb7332, crates/victory-gpu/src/pipeline/host.rs
+// GraphicsState::apply_integer_blend_bypass, called from pipeline.rs create_stream.
+inline unsigned bypass_integer_target_blend(std::array<TargetBlend, 8>& targets, bool& independent, unsigned count,
+                                            const std::array<std::uint8_t, 8>& formats) {
+    if (count > targets.size()) count = unsigned(targets.size());
+    bool integer = false;
+    for (unsigned i = 0; i < count; ++i) integer = integer || dxgi_integer_format(formats[i]);
+    if (!integer) return 0;
+    if (!independent) {
+        if (!targets[0].enable) return 0;  // shared blending is off, so every target's is
+        for (unsigned i = 1; i < count; ++i) targets[i] = targets[0];
+        independent = count > 1;
+    }
+    unsigned cleared = 0;
+    for (unsigned i = 0; i < count; ++i) {
+        if (!dxgi_integer_format(formats[i])) continue;
+        if (targets[i].enable) ++cleared;
+        targets[i].enable = false;
+    }
+    return cleared;
+}
+
 // The depth, stencil and raster state in D3D12 terms, with D3D12_COMPARISON_FUNC, D3D12_STENCIL_OP and D3D12_CULL_MODE
 // values (d3d12.h). The defaults are the factory's state before blob A was read.
 struct StencilFace {

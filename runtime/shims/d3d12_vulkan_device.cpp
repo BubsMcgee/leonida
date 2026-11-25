@@ -56,6 +56,8 @@
 #include "../src/title_geometry_watch.h"
 #include "../src/title_texture_memory.h"
 #include "../src/title_texture_refresh.h"
+#include "../src/title_staging.h"
+#include "../src/pipeline_workers.h"
 #include "title_gpu_placements.h"
 #include "../src/spirv_f16_halves.h"
 #include "../src/spirv_stores.h"
@@ -5593,9 +5595,10 @@ public:
     bool replay_seen() const { return replay_seen_.load(std::memory_order_relaxed); }
     bool staged_title() const { return staged_title_; }
     bool upload_staged_title(const rt::xg_xs::Texture& layout, const std::uint8_t* tiled,
-                             std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero) {
+                             std::vector<std::uint64_t>& columns, bool inspect, bool& nonzero,
+                             unsigned first_mip = 0) {
         std::lock_guard lock(device_.title_upload_mutex);
-        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero);
+        return device_.title_upload.write(device_, id(), binding_, layout, tiled, columns, inspect, nonzero, first_mip);
     }
     // Map and the destructor notify the registry for a slot-133 placement.
     void mark_title_texture() { title_texture_ = true; }
@@ -8011,6 +8014,39 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     }
     if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
     if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
+    // Integer-target blend bypass (D3D-INTEGER-TARGET-BLEND-BYPASS): RDNA2 does not blend an integer target, so a
+    // console stream can carry an enable bit on one that D3D12 would refuse. D3D12 refuses a logic op with
+    // independent blending, and a valid shared logic-op state already has blending off, so that state is left alone.
+    if (!out.has_cs && !(!g.BlendState.IndependentBlendEnable && g.BlendState.RenderTarget[0].LogicOpEnable)) {
+        D3D12_BLEND_DESC& b = g.BlendState;
+        const unsigned count = g.NumRenderTargets;
+        std::array<leonida::native_pso::TargetBlend, 8> targets{};
+        std::array<std::uint8_t, 8> formats{};
+        for (unsigned i = 0; i < targets.size(); ++i) {
+            const D3D12_RENDER_TARGET_BLEND_DESC& t = b.RenderTarget[i];
+            targets[i] = {t.BlendEnable != FALSE, std::uint8_t(t.SrcBlend), std::uint8_t(t.DestBlend),
+                          std::uint8_t(t.BlendOp), std::uint8_t(t.SrcBlendAlpha), std::uint8_t(t.DestBlendAlpha),
+                          std::uint8_t(t.BlendOpAlpha), std::uint8_t(t.RenderTargetWriteMask)};
+            formats[i] = std::uint8_t(g.RTVFormats[i]);
+        }
+        bool independent = b.IndependentBlendEnable != FALSE;
+        const unsigned cleared = leonida::native_pso::bypass_integer_target_blend(targets, independent, count, formats);
+        if (cleared) {
+            b.IndependentBlendEnable = independent ? TRUE : FALSE;
+            for (unsigned i = 0; i < count && i < targets.size(); ++i) {
+                D3D12_RENDER_TARGET_BLEND_DESC& t = b.RenderTarget[i];
+                t.BlendEnable = targets[i].enable ? TRUE : FALSE;
+                t.SrcBlend = D3D12_BLEND(targets[i].src);
+                t.DestBlend = D3D12_BLEND(targets[i].dst);
+                t.BlendOp = D3D12_BLEND_OP(targets[i].op);
+                t.SrcBlendAlpha = D3D12_BLEND(targets[i].src_alpha);
+                t.DestBlendAlpha = D3D12_BLEND(targets[i].dst_alpha);
+                t.BlendOpAlpha = D3D12_BLEND_OP(targets[i].op_alpha);
+                t.RenderTargetWriteMask = targets[i].write_mask;
+            }
+            log_once("integer-target blending bypassed (D3D-INTEGER-TARGET-BLEND-BYPASS); targets", int(cleared));
+        }
+    }
     return S_OK;
 }
 
@@ -10136,6 +10172,7 @@ struct TitleTexture {
     bool full_hashed = false;
     bool every_byte() const { return mapped && layout.layout.size <= (4u << 20); }
     std::uint64_t fills = 0;
+    leonida::TitleStaging staging;          // the mip tail the last read covered, and the retry state
 };
 
 // The layout of a slot-133 texture as the title's own XG computer for its shape says (title_xg_layouts): how the title
@@ -10206,6 +10243,7 @@ void DeviceState::title_texture_unmapped(const void* resource, std::uint64_t add
     if (it != title_textures.end() && it->second->resource == resource) {
         it->second->stale = true;
         it->second->memory.retry();
+        it->second->staging.note_dirty();
     }
 }
 
@@ -11990,7 +12028,7 @@ public:
                 return;
             }
             std::uint64_t hash = 0;
-            if (!title_texture_readable(t)) return;
+            if (!title_texture_readable(t) && first_uploadable(t) < 0) return;
             checked += hashed_bytes(span);
             ++stats.checked;
             const auto* bytes = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(t.cpu));
@@ -12150,7 +12188,7 @@ private:
         std::deque<std::uint64_t> queue;  // texture addresses
         std::unordered_set<std::uint64_t> queued;
         bool stop = false;
-        std::thread thread;
+        std::unique_ptr<leonida::PipelineWorkers> pool;
         std::uint64_t filled = 0, skipped = 0;
         std::vector<std::uint8_t> tiled;      // the worker's own snapshot of a texture's bytes (fill_unlocked)
         std::vector<std::uint64_t> columns;   // its detiling scratch
@@ -12159,17 +12197,28 @@ private:
                 std::lock_guard lock(mutex);
                 stop = true;
             }
-            wake.notify_one();
-            if (thread.joinable()) thread.join();
+            wake.notify_all();
+            if (pool) pool->stop();
         }
     };
+    // LEONIDA_TITLE_FILL_WORKERS: how many fill workers the pool may start (default 4, matching the Radeon
+    // runtime's upload workers). A title that only needs its textures filled can raise it.
+    static unsigned title_fill_workers() {
+        static const unsigned n = [] {
+            const char* v = std::getenv("LEONIDA_TITLE_FILL_WORKERS");
+            const unsigned long requested = v && *v ? std::strtoul(v, nullptr, 10) : 4;
+            return static_cast<unsigned>(std::max<unsigned long>(1, requested));
+        }();
+        return n;
+    }
     std::unique_ptr<TitleFiller> title_filler_;
     std::once_flag title_filler_once_;
     void queue_title_fill(std::uint64_t address) {
         std::call_once(title_filler_once_, [this] {
             title_filler_ = std::make_unique<TitleFiller>();
             TitleFiller* f = title_filler_.get();
-            f->thread = std::thread([this, f] { run_title_filler(*f); });
+            f->pool = std::make_unique<leonida::PipelineWorkers>(title_fill_workers());
+            f->pool->run(1, [this, f](std::size_t) { run_title_filler(*f); });
         });
         {
             std::lock_guard lock(title_filler_->mutex);
@@ -12248,18 +12297,37 @@ private:
     // under it, if the registry still names `r` at `address` and nobody filled it meanwhile.
     bool fill_unlocked(std::uint64_t address, Resource& r, const rt::xg_xs::Texture& layout, std::uint64_t cpu,
                        std::uint64_t fills, bool every_byte, TitleFiller& f) {
+        // The worker needs the texture's staging state before the upload picks a tail; the registry is locked only
+        // for that lookup, then again for the result.
+        int first = 0;
+        {
+            std::lock_guard lock(state_.title_texture_mutex);
+            const InTitleTextures inside;
+            const auto it = state_.title_textures.find(address);
+            if (it == state_.title_textures.end() || it->second->resource != &r) return false;
+            first = first_uploadable(*it->second);
+            if (first < 0) {
+                it->second->memory.defer();
+                it->second->stale = true;
+                return false;
+            }
+        }
         const std::uint64_t span = layout.layout.size;
+        const std::uint64_t offset = layout.layout.plane[0].mips[first].offset;
+        const std::uint64_t tail = span - offset;
         f.tiled.resize(std::size_t(span));
-        const bool copied = copy_guarded(f.tiled.data(), reinterpret_cast<const std::uint8_t*>(cpu), std::size_t(span),
-                                         title_memory_write_combined(cpu));
+        const bool copied = copy_guarded(f.tiled.data() + offset,
+                                         reinterpret_cast<const std::uint8_t*>(cpu) + offset, std::size_t(tail),
+                                         title_memory_write_combined(cpu + offset));
         std::uint64_t hash = 0, full = 0;
         bool full_hashed = false, ok = false, nonzero = false;
         std::uint64_t staged_ns = 0;
         if (copied) {
-            hash_guarded(f.tiled.data(), f.tiled.size(), hash);
-            full_hashed = every_byte && hash_guarded(f.tiled.data(), f.tiled.size(), full, true);
+            hash_guarded(f.tiled.data() + offset, std::size_t(tail), hash);
+            full_hashed = every_byte && hash_guarded(f.tiled.data() + offset, std::size_t(tail), full, true);
             const auto start = std::chrono::steady_clock::now();
-            ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero);
+            ok = r.upload_staged_title(layout, f.tiled.data(), f.columns, false, nonzero,
+                                       static_cast<unsigned>(first));
             staged_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start)
                             .count();
         }
@@ -12288,6 +12356,7 @@ private:
         t.full_hash = full;
         t.full_hashed = full_hashed;
         ++t.fills;
+        t.staging.note_read(first, t.fills);
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
         return true;
@@ -12614,6 +12683,25 @@ private:
                               guard && !mapped);
     }
 
+    // One mip's tiled range is readable now: a partly mapped streamed texture plans its upload from the lowest such
+    // mip, so the smaller tail that has arrived need not wait for the large first mips.
+    bool title_mip_readable(TitleTexture& t, unsigned mip) {
+        const auto& m = t.layout.layout.plane[0].mips[mip];
+        if (!m.size || !t.cpu) return false;
+        const auto commit = t.mapped && refresh_mapped_pages()
+                                ? leonida::kernel_writes::state().committer.load(std::memory_order_acquire)
+                                : nullptr;
+        return probe_title_memory(t.cpu + m.offset, m.size, t.memory.pending(), commit);
+    }
+
+    // The lowest readable mip (the tail's start), or -1 when none is.
+    int first_uploadable(TitleTexture& t) {
+        const int mips = int(t.layout.layout.mips);
+        return leonida::TitleStaging::first_uploadable(mips, [&](int mip) {
+            return title_mip_readable(t, static_cast<unsigned>(mip));
+        });
+    }
+
     // LEONIDA_TITLE_VIEW_REFRESH_MS (0 by default: at every view): a texture's bytes are checked when a slot-70 view of
     // it is written at most this often (the refresh pass still looks at it on its own period, and a stale texture is
     // checked at once). After the load a title thread spent a fifth of its time hashing textures here, view by view
@@ -12656,10 +12744,13 @@ private:
                     return 0;
                 }
         const std::uint64_t span = layout.layout.size;
-        if (!title_texture_readable(t)) return 0;
+        const int first = first_uploadable(t);
+        if (first < 0) return 0;
+        const std::uint64_t offset = layout.layout.plane[0].mips[first].offset;
+        const std::uint64_t tail = span - offset;
         title_tiled_.resize(std::size_t(span));
-        if (!copy_guarded(title_tiled_.data(), reinterpret_cast<const std::uint8_t*>(t.cpu), std::size_t(span),
-                          title_memory_write_combined(t.cpu))) {
+        if (!copy_guarded(title_tiled_.data() + offset, reinterpret_cast<const std::uint8_t*>(t.cpu) + offset,
+                          std::size_t(tail), title_memory_write_combined(t.cpu + offset))) {
             // The section changed after VirtualQuery. Preserve the last complete upload and retry.
             t.memory.defer();
             t.stale = true;
@@ -12688,7 +12779,8 @@ private:
         bool ok = true;
         if (t.resource->staged_title()) {
             const auto start = std::chrono::steady_clock::now();
-            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero);
+            ok = t.resource->upload_staged_title(layout, title_tiled_.data(), title_columns_, trace_pool, nonzero,
+                                                 static_cast<unsigned>(first));
             title_stats_.staged_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - start).count();
             if (ok) ++title_stats_.staged_fills;
@@ -12728,6 +12820,7 @@ private:
         t.hashed = true;
         t.stale = false;
         ++t.fills;
+        t.staging.note_read(first, t.fills);
         ++title_stats_.fills;
         title_stats_.fill_bytes += span;
         return span;

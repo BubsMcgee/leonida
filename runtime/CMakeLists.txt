@@ -775,6 +775,9 @@ if(BUILD_TESTING)
   target_link_libraries(pipeline_workers_test PRIVATE Threads::Threads)
   add_test(NAME pipeline_workers COMMAND pipeline_workers_test)
   set_tests_properties(pipeline_workers PROPERTIES TIMEOUT 120)
+  # Title texture streaming state and the shared per-pass upload budget (runtime/src/title_staging.h): pure stdlib.
+  add_executable(title_staging_test test/title_staging_test.cpp)
+  add_test(NAME title_staging COMMAND title_staging_test)
 
   # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
   add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
@@ -1392,6 +1395,9 @@ if(BUILD_TESTING)
   add_test(NAME shader_library COMMAND shader_library_test)
   add_executable(native_pso_blend_test test/native_pso_blend_test.cpp)
   add_test(NAME native_pso_blend COMMAND native_pso_blend_test)
+  # The console stream's integer-target blend bypass (D3D-INTEGER-TARGET-BLEND-BYPASS): pure stdlib.
+  add_executable(native_pso_integer_blend_test test/native_pso_integer_blend_test.cpp)
+  add_test(NAME native_pso_integer_blend COMMAND native_pso_integer_blend_test)
   add_executable(native_pso_depth_test test/native_pso_depth_test.cpp)
   add_test(NAME native_pso_depth COMMAND native_pso_depth_test)
   if(WIN32)
