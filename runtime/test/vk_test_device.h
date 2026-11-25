@@ -119,6 +119,12 @@ public:
     bool request_mesh_shader = false;  // set before create(): enable VK_EXT_mesh_shader (meshShader) where available
     bool mesh_shader = false;          // VK_EXT_mesh_shader and meshShader are enabled
     bool mesh_shader_queries = false;  // the meshShaderQueries feature is enabled on the device
+    // set before create(): enable VK_EXT_transform_feedback (D3D-302) where available
+    bool request_transform_feedback = false;
+    bool transform_feedback = false;                  // VK_EXT_transform_feedback and transformFeedback are enabled
+    bool transform_feedback_geometry_streams = false;  // the geometryStreams feature is enabled on the device
+    std::uint32_t max_transform_feedback_buffers = 0;  // VkPhysicalDeviceTransformFeedbackPropertiesEXT; 0: disabled
+    std::uint32_t max_transform_feedback_streams = 0;
     bool debug_utils = false;          // VK_EXT_debug_utils is enabled on the instance
     // The subgroup sizes of the device, with subgroupSizeControl and computeFullSubgroups enabled where it has them.
     leonida::SubgroupSizeCaps subgroup;
@@ -533,6 +539,32 @@ public:
             mesh_features.meshShaderQueries = mesh_shader_queries ? VK_TRUE : VK_FALSE;
             *v13_.next() = &mesh_features;
         }
+        // VK_EXT_transform_feedback (D3D-302), for the tests that ask for it.
+        VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback_features{
+            VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+        if (request_transform_feedback && std::any_of(extensions.begin(), extensions.end(), [](const auto& e) {
+                return std::strcmp(e.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME) == 0;
+            })) {
+            VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &transform_feedback_features};
+            instance_fn<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(physical, &query);
+            transform_feedback = transform_feedback_features.transformFeedback == VK_TRUE;
+            transform_feedback_geometry_streams = transform_feedback_features.geometryStreams == VK_TRUE;
+            if (transform_feedback) {
+                VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{
+                    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
+                VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &tf_props};
+                instance_fn<PFN_vkGetPhysicalDeviceProperties2>("vkGetPhysicalDeviceProperties2")(physical, &props);
+                max_transform_feedback_buffers = tf_props.maxTransformFeedbackBuffers;
+                max_transform_feedback_streams = tf_props.maxTransformFeedbackStreams;
+            }
+        }
+        if (transform_feedback) {
+            transform_feedback_features = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT,
+                                           *v13_.next()};
+            transform_feedback_features.transformFeedback = VK_TRUE;
+            transform_feedback_features.geometryStreams = transform_feedback_geometry_streams ? VK_TRUE : VK_FALSE;
+            *v13_.next() = &transform_feedback_features;
+        }
         enable.occlusionQueryPrecise = features.features.occlusionQueryPrecise;  // query heaps, where available
         enable.pipelineStatisticsQuery = features.features.pipelineStatisticsQuery;
         occlusion_query_precise = features.features.occlusionQueryPrecise == VK_TRUE;
@@ -610,6 +642,7 @@ public:
 #endif
         if (custom_border_color) device_extensions.push_back(custom_border_color_name);
         if (mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+        if (transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
         device_info.enabledExtensionCount = std::uint32_t(device_extensions.size());
         device_info.ppEnabledExtensionNames = device_extensions.data();
         result = instance_fn<PFN_vkCreateDevice>("vkCreateDevice")(physical, &device_info, nullptr, &device);

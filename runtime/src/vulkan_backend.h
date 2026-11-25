@@ -107,7 +107,8 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass) X(vkCmdBindTransformFeedbackBuffersEXT)                      \
+    X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -994,6 +995,10 @@ public:
         replay_.draw = vk.vkCmdDraw;
         replay_.draw_mesh_tasks = vk.vkCmdDrawMeshTasksEXT;  // null unless VK_EXT_mesh_shader is enabled
         replay_.draw_indexed = vk.vkCmdDrawIndexed;
+        // null unless VK_EXT_transform_feedback is enabled (D3D-302)
+        replay_.bind_transform_feedback_buffers = vk.vkCmdBindTransformFeedbackBuffersEXT;
+        replay_.begin_transform_feedback = vk.vkCmdBeginTransformFeedbackEXT;
+        replay_.end_transform_feedback = vk.vkCmdEndTransformFeedbackEXT;
         replay_.graphics_pipeline = [this](std::uintptr_t id) -> const GraphicsPipeline* {
             const auto it = graphics_pipelines_.find(id);
             return it == graphics_pipelines_.end() ? nullptr : &it->second;

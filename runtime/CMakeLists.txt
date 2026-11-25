@@ -2887,6 +2887,33 @@ if(TARGET Vulkan::Headers)
       add_test(NAME d3d12_pso_validation COMMAND d3d12_pso_validation_test)
       set_tests_properties(d3d12_pso_validation PROPERTIES SKIP_RETURN_CODE 77
                            FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
+      # D3D-302: a StreamOutput PSO and SOSetTargets actually capture a draw's output, read back and checked
+      # against the shader's fixed vec4. The PS just needs a valid render target to rasterize into (its own
+      # output colour is not checked), so it is its own trivial shader rather than ps_draw's CBV-reading one.
+      set(LEONIDA_TEST_VS_STREAM_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_stream_output.spv)
+      set(LEONIDA_TEST_PS_STREAM_OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_stream_output.spv)
+      foreach(pair "vs_stream_output.vert;${LEONIDA_TEST_VS_STREAM_OUTPUT}"
+                   "ps_stream_output.frag;${LEONIDA_TEST_PS_STREAM_OUTPUT}")
+        list(GET pair 0 source)
+        list(GET pair 1 output)
+        add_custom_command(
+          OUTPUT ${output}
+          COMMAND ${Vulkan_GLSLANG_VALIDATOR_EXECUTABLE} -V --target-env vulkan1.3 -o ${output}
+                  ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/test/glsl/${source}
+          COMMENT "Compiling the stream-output test shader ${source}"
+          VERBATIM)
+      endforeach()
+      add_executable(d3d12_stream_output_test test/d3d12_stream_output_test.cpp shims/d3d12_xs_device.cpp
+                     ${LEONIDA_TEST_VS_STREAM_OUTPUT} ${LEONIDA_TEST_PS_STREAM_OUTPUT})
+      target_link_libraries(d3d12_stream_output_test PRIVATE gta6rt_d3d12_com)
+      target_compile_definitions(d3d12_stream_output_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX
+                                 LEONIDA_TEST_VS_STREAM_OUTPUT_SPV="${LEONIDA_TEST_VS_STREAM_OUTPUT}"
+                                 LEONIDA_TEST_PS_STREAM_OUTPUT_SPV="${LEONIDA_TEST_PS_STREAM_OUTPUT}")
+      target_compile_options(d3d12_stream_output_test PRIVATE /W4 /permissive- /utf-8)
+      add_test(NAME d3d12_stream_output COMMAND d3d12_stream_output_test)
+      set_tests_properties(d3d12_stream_output PROPERTIES SKIP_RETURN_CODE 77
+                           FAIL_REGULAR_EXPRESSION "Validation Error;VUID-")
       # Conservative raster Tier 1, with geometric coverage bounds and host D3D12 references.
       set(LEONIDA_CONSERVATIVE_VS ${CMAKE_CURRENT_BINARY_DIR}/generated/vs_conservative.spv)
       set(LEONIDA_CONSERVATIVE_PS ${CMAKE_CURRENT_BINARY_DIR}/generated/ps_conservative.spv)

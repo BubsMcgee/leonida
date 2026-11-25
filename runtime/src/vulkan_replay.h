@@ -779,6 +779,11 @@ struct GraphicsPipeline {
     static constexpr std::uint32_t unbound_depth = 1u << 8;
     std::function<VkPipeline(std::uint32_t unbound)> variant;
     std::uint32_t samples = 1;  // rasterizationSamples; every bound attachment must have this count
+    // D3D12_STREAM_OUTPUT_DESC, kept to capture and wrap draws with this pipeline bound (D3D-302). Empty
+    // so_strides: the PSO declared no StreamOutput, same as before this was tracked at all.
+    std::vector<std::uint32_t> so_strides;       // by buffer slot, NumStrides entries
+    std::uint32_t so_rasterized_stream = 0;      // D3D12_SO_NO_RASTERIZED_STREAM: no stream is rasterized
+    bool has_stream_output() const { return !so_strides.empty(); }
 };
 
 // The 144-byte push-constant block every translated shader declares: s0..s31, heap base, code base.
@@ -861,6 +866,10 @@ struct ReplayFunctions {
     PFN_vkCmdDraw draw = nullptr;
     PFN_vkCmdDrawMeshTasksEXT draw_mesh_tasks = nullptr;  // VK_EXT_mesh_shader; null: mesh draws are unsupported
     PFN_vkCmdDrawIndexed draw_indexed = nullptr;
+    // VK_EXT_transform_feedback (D3D-302); null: StreamOutput pipelines are unsupported (create_graphics refuses them).
+    PFN_vkCmdBindTransformFeedbackBuffersEXT bind_transform_feedback_buffers = nullptr;
+    PFN_vkCmdBeginTransformFeedbackEXT begin_transform_feedback = nullptr;
+    PFN_vkCmdEndTransformFeedbackEXT end_transform_feedback = nullptr;
     std::function<const GraphicsPipeline*(std::uintptr_t)> graphics_pipeline;
     // The buffer and offset a console VA range starts in (from ResourceBinding::va), false when none does. `size` is
     // cut to what the buffer holds from there: vertex and index views use what fits, WriteBufferImmediate needs all
@@ -1076,6 +1085,15 @@ struct PreparedDraw {
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
+    // D3D-302: graphics->so_strides.size() entries when the pipeline declares StreamOutput, else empty. A slot
+    // with no bound SOSetTargets buffer resolves to VK_NULL_HANDLE, which vkCmdBindTransformFeedbackBuffersEXT
+    // refuses (VUID-vkCmdBindTransformFeedbackBuffersEXT-pBuffers-parameter), so the draw is unsupported instead.
+    std::vector<VkBuffer> so_buffers;
+    std::vector<VkDeviceSize> so_offsets, so_sizes;
+    // The counter (BufferFilledSizeLocation) for each so_buffers entry, or VK_NULL_HANDLE: Begin starts that
+    // stream's running count at 0 instead of resuming it, and End does not write one back.
+    std::vector<VkBuffer> so_counter_buffers;
+    std::vector<VkDeviceSize> so_counter_offsets;
 
     // Back to a new draw's state, keeping the vectors' storage.
     void reset() {
@@ -1092,6 +1110,11 @@ struct PreparedDraw {
         index_type = VK_INDEX_TYPE_UINT16;
         area = {};
         layers = 1;
+        so_buffers.clear();
+        so_offsets.clear();
+        so_sizes.clear();
+        so_counter_buffers.clear();
+        so_counter_offsets.clear();
     }
 };
 
@@ -2223,6 +2246,42 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             return ReplayResult::unresolved_resource;
         p.vertex_sizes[slot] = size;
         p.vertex_strides[slot] = (pipeline->zero_step_slots & (1u << slot)) ? 0 : view.stride;
+    }
+    // D3D-302: resolve this draw's bound StreamOutput targets. The pipeline's so_strides.size() names how many
+    // buffer slots its declaration uses. Assumption, with no device to check it against (docs/d3d12_vulkan.md
+    // D3D-302): if any of those slots has no SOSetTargets buffer currently bound, stream output stays inactive
+    // for this draw (an ordinary draw, not a refusal) rather than failing it.
+    if (!pipeline->so_strides.empty()) {
+        const std::size_t count = pipeline->so_strides.size();
+        std::vector<VkBuffer> so_buffers(count, VK_NULL_HANDLE);
+        std::vector<VkDeviceSize> so_offsets(count, 0), so_sizes(count, 0);
+        std::vector<VkBuffer> so_counters(count, VK_NULL_HANDLE);
+        std::vector<VkDeviceSize> so_counter_offsets(count, 0);
+        bool all_bound = true;
+        for (std::size_t slot = 0; slot < count && all_bound; ++slot) {
+            const bool bound = draw.views && slot < draw.views->so_buffers.size() && draw.views->so_buffers[slot].va;
+            if (!bound) {
+                all_bound = false;
+                break;
+            }
+            const SOBufferView& view = draw.views->so_buffers[slot];
+            std::uint64_t size = view.size;
+            if (!vk.buffer_at(view.va, size, so_buffers[slot], so_offsets[slot]))
+                return ReplayResult::unresolved_resource;
+            so_sizes[slot] = size;
+            if (view.filled_size_va) {
+                std::uint64_t counter_size = sizeof(std::uint64_t);
+                if (!vk.buffer_at(view.filled_size_va, counter_size, so_counters[slot], so_counter_offsets[slot]))
+                    return ReplayResult::unresolved_resource;
+            }
+        }
+        if (all_bound) {
+            p.so_buffers = std::move(so_buffers);
+            p.so_offsets = std::move(so_offsets);
+            p.so_sizes = std::move(so_sizes);
+            p.so_counter_buffers = std::move(so_counters);
+            p.so_counter_offsets = std::move(so_counter_offsets);
+        }
     }
     if (draw.indexed) {
         if (draw.index.format == 57) p.index_type = VK_INDEX_TYPE_UINT16;
@@ -4272,6 +4331,18 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
+            // D3D-302: active only when every buffer slot the pipeline's StreamOutput declares is currently bound
+            // (prepare_draw leaves d.so_buffers empty otherwise). Bind must run before Begin, and both must be
+            // inside the render pass this draw is already in (VUID-vkCmdBeginTransformFeedbackEXT-None-02365).
+            const bool stream_output = !d.so_buffers.empty() && vk.bind_transform_feedback_buffers &&
+                                       vk.begin_transform_feedback && vk.end_transform_feedback;
+            if (stream_output) {
+                const auto count = std::uint32_t(d.so_buffers.size());
+                vk.bind_transform_feedback_buffers(command_buffer, 0, count, d.so_buffers.data(), d.so_offsets.data(),
+                                                   d.so_sizes.data());
+                vk.begin_transform_feedback(command_buffer, 0, count, d.so_counter_buffers.data(),
+                                            d.so_counter_offsets.data());
+            }
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
             } else if (draw->indexed) {
@@ -4280,6 +4351,11 @@ inline void emit(const PreparedList& prepared, VkCommandBuffer command_buffer, c
                                 draw->first_instance);
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
+            }
+            if (stream_output) {
+                const auto count = std::uint32_t(d.so_buffers.size());
+                vk.end_transform_feedback(command_buffer, 0, count, d.so_counter_buffers.data(),
+                                          d.so_counter_offsets.data());
             }
             vk.end_rendering(command_buffer);
         }

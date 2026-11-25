@@ -3448,9 +3448,27 @@ public:
             if (rt0.BlendEnable && rt0.LogicOpEnable) return E_INVALIDARG;
             if (rt0.LogicOpEnable && unsigned(rt0.LogicOp) > D3D12_LOGIC_OP_OR_INVERTED) return E_INVALIDARG;
         }
-        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength || desc.StreamOutput.NumEntries) {
-            log_once("graphics pipeline stage not supported yet (hull/domain/stream output):", 0);
+        if (desc.HS.BytecodeLength || desc.DS.BytecodeLength) {
+            log_once("graphics pipeline stage not supported yet (hull/domain):", 0);
             return E_NOTIMPL;
+        }
+        // D3D-302: the plumbing only covers the common case (one rasterized stream, the default stream 0). A
+        // RasterizedStream other than 0 (an explicit stream, or D3D12_SO_NO_RASTERIZED_STREAM for capture-only)
+        // needs VkPipelineRasterizationStateStreamCreateInfoEXT / rasterizerDiscardEnable at pipeline creation,
+        // which is follow-up work; refuse it cleanly instead of silently rasterizing the wrong stream.
+        const D3D12_STREAM_OUTPUT_DESC& stream_output_desc = desc.StreamOutput;
+        const bool stream_output = stream_output_desc.NumEntries > 0;
+        if (stream_output) {
+            if (!device_.info.transform_feedback || !vk.vkCmdBeginTransformFeedbackEXT) {
+                log_once("StreamOutput PSOs need VK_EXT_transform_feedback, which the device has not enabled; stage",
+                        1);
+                return E_NOTIMPL;
+            }
+            if (stream_output_desc.NumStrides > device_.info.max_transform_feedback_buffers) return E_INVALIDARG;
+            if (stream_output_desc.RasterizedStream != 0) {
+                log_once("StreamOutput with a RasterizedStream other than 0 is not supported yet; stage", 1);
+                return E_NOTIMPL;
+            }
         }
         // A geometry shader is the translator's Vulkan geometry stage (docs/design.md, "Geometry shaders"): it takes
         // triangles and emits a triangle strip. It needs the geometryShader feature, and the PSO's topology type must
@@ -3936,6 +3954,9 @@ public:
 
         // Kept for variants: a draw that leaves a slot unbound needs this pipeline with that format undefined.
         graphics_.mesh = mesh;
+        if (stream_output)
+            graphics_.so_strides.assign(stream_output_desc.pBufferStrides,
+                                        stream_output_desc.pBufferStrides + stream_output_desc.NumStrides);
         recipe_.mesh = mesh;
         recipe_.stages = std::move(stage_infos);
         recipe_.attributes = std::move(attributes);
@@ -4943,10 +4964,12 @@ public:
             info.queryType = VK_QUERY_TYPE_TIMESTAMP;
             break;
         case h::so_statistics:
-            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
-            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
-            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
-            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
+            // D3D-302: StreamOutput PSOs and SOSetTargets now capture real primitives (prepare_draw,
+            // vulkan_replay.h), but this heap's counters are not wired to that yet: every query still counts 0
+            // written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills
+            // zeros. Follow-up: a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool with the indexed
+            // vkCmdBeginQueryIndexedEXT/EndQueryIndexedEXT commands, read back through the counter buffers
+            // SOSetTargets' BufferFilledSizeLocation already resolves.
             return register_pool(desc);
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
@@ -9508,6 +9531,14 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.transform_feedback = transform_feedback_features.transformFeedback == VK_TRUE;
                 info.transform_feedback_geometry_streams = transform_feedback_features.geometryStreams == VK_TRUE;
+                if (info.transform_feedback) {
+                    VkPhysicalDeviceTransformFeedbackPropertiesEXT tf_props{
+                        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_PROPERTIES_EXT};
+                    VkPhysicalDeviceProperties2 props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &tf_props};
+                    vkGetPhysicalDeviceProperties2(info.physical, &props);
+                    info.max_transform_feedback_buffers = tf_props.maxTransformFeedbackBuffers;
+                    info.max_transform_feedback_streams = tf_props.maxTransformFeedbackStreams;
+                }
             }
         }
         if (!info.mesh_shader)
