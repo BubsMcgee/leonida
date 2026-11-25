@@ -10538,11 +10538,14 @@ public:
             break;
         }
         case h::so_statistics:
-            // The layer has no stream output: a graphics PSO with StreamOutput entries is refused (E_NOTIMPL) and
-            // SOSetTargets is not implemented, so no primitive ever reaches a stream and every query of this heap
-            // counts 0 written and 0 needed. That needs no Vulkan pool: Begin/EndQuery run nothing and a resolve fills zeros. When stream
-            // output lands, this becomes a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool (D3D-302).
-            return register_pool(desc);
+            // D3D-302: with VK_EXT_transform_feedback enabled, an SO_STATISTICS heap is a real transform-feedback
+            // pool whose queries begin/end on a stream (vkCmdBeginQueryIndexedEXT); a resolve copies 16 bytes per
+            // query (NumPrimitivesWritten, PrimitivesStorageNeeded), in the same order. StreamOutput PSOs are still
+            // refused and SOSetTargets is still not implemented, so no primitive reaches a stream yet and every
+            // query counts 0. Without the feature the heap is made without a pool and every query resolves to zero.
+            if (!device_.info.transform_feedback) return register_pool(desc);
+            info.queryType = VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT;
+            break;
         case h::pipeline_statistics:
             if (!device_.info.pipeline_statistics_query) {
                 log_once("pipeline-statistics query heap: pipelineStatisticsQuery not enabled; type", desc.Type);
@@ -17643,6 +17646,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
     VkPhysicalDeviceRayQueryFeaturesKHR rq_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
     VkPhysicalDeviceMeshShaderFeaturesEXT mesh_features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_FEATURES_EXT};
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT transform_feedback_features{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
     {
         std::uint32_t extension_count = 0;
         vkEnumerateDeviceExtensionProperties(info.physical, nullptr, &extension_count, nullptr);
@@ -17667,10 +17672,19 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
                 vkGetPhysicalDeviceFeatures2(info.physical, &features);
                 info.mesh_shader = mesh_features.meshShader == VK_TRUE;
                 info.mesh_shader_queries = mesh_features.meshShaderQueries == VK_TRUE;
+            } else if (!std::strcmp(e.extensionName, VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME)) {
+                VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
+                                                   &transform_feedback_features};
+                vkGetPhysicalDeviceFeatures2(info.physical, &features);
+                info.transform_feedback = transform_feedback_features.transformFeedback == VK_TRUE;
+                info.transform_feedback_geometry_streams = transform_feedback_features.geometryStreams == VK_TRUE;
             }
         }
         if (!info.mesh_shader)
             std::fprintf(stderr, "[rt] d3d12: the GPU has no VK_EXT_mesh_shader: mesh-shader PSOs are unsupported\n");
+        if (!info.transform_feedback)
+            std::fprintf(stderr,
+                         "[rt] d3d12: the GPU has no VK_EXT_transform_feedback: SO_STATISTICS query pools read zero\n");
         if (has_as && has_dho && has_rq && chosen12.bufferDeviceAddress) {
             as_features.pNext = &rq_features;
             VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &as_features};
@@ -17706,10 +17720,21 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     // The mesh-primitives query, which counts the primitives a mesh shader emits (D3D-MESH-CLIPPING-COUNTER).
     enable_mesh.meshShaderQueries = info.mesh_shader_queries ? VK_TRUE : VK_FALSE;
 
+    // D3D-302: real SO_STATISTICS queries need transformFeedback; geometryStreams is only requested when the device
+    // already offers it, so the enable chain matches vk_pipeline_check's (a driver keys the pipeline cache on it).
+    VkPhysicalDeviceTransformFeedbackFeaturesEXT enable_transform_feedback{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TRANSFORM_FEEDBACK_FEATURES_EXT};
+    enable_transform_feedback.transformFeedback = VK_TRUE;
+    enable_transform_feedback.geometryStreams = info.transform_feedback_geometry_streams ? VK_TRUE : VK_FALSE;
+
     void* ext_chain = nullptr;
     if (info.mesh_shader) {
         enable_mesh.pNext = ext_chain;
         ext_chain = &enable_mesh;
+    }
+    if (info.transform_feedback) {
+        enable_transform_feedback.pNext = ext_chain;
+        ext_chain = &enable_transform_feedback;
     }
     if (info.ray_tracing) {
         enable_rq.pNext = ext_chain;
@@ -18213,6 +18238,7 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     if (has_swapchain && instance_has_surface) device_extensions.push_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
     if (swapchain_m1_name) device_extensions.push_back(swapchain_m1_name);
     if (info.mesh_shader) device_extensions.push_back(VK_EXT_MESH_SHADER_EXTENSION_NAME);
+    if (info.transform_feedback) device_extensions.push_back(VK_EXT_TRANSFORM_FEEDBACK_EXTENSION_NAME);
     if (info.ray_tracing) {
         device_extensions.push_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
         device_extensions.push_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);

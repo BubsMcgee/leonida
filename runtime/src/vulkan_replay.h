@@ -822,8 +822,9 @@ struct OcclusionResult {
 // A D3D12 query heap on Vulkan. The host tracks which queries hold a result. A resolve of a query that
 // was never ended writes zeros instead of waiting on it.
 struct QueryPool {
-    // Null for a stream-output statistics heap: the layer has no stream output (PSOs with StreamOutput entries are
-    // refused), so every SO_STATISTICS_STREAMn query counts 0 written and 0 needed, and a resolve fills zeros.
+    // Null for a stream-output statistics heap on a device without VK_EXT_transform_feedback (D3D-302): every
+    // SO_STATISTICS_STREAMn query then counts 0 written and 0 needed, and a resolve fills zeros. With the feature
+    // it is a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool, begun/ended indexed on the stream.
     VkQueryPool pool = VK_NULL_HANDLE;
     std::uint32_t heap_type = 0;  // d3d12_query_heap
     std::uint32_t count = 0;
@@ -1066,6 +1067,10 @@ struct ReplayFunctions {
     PFN_vkCmdResetQueryPool reset_query_pool = nullptr;  // queries, with fill_buffer for unavailable results
     PFN_vkCmdBeginQuery begin_query = nullptr;
     PFN_vkCmdEndQuery end_query = nullptr;
+    // VK_EXT_transform_feedback (D3D-302): SO_STATISTICS queries begin/end indexed on a stream. Null when the device
+    // lacks the feature.
+    PFN_vkCmdBeginQueryIndexedEXT begin_query_indexed = nullptr;
+    PFN_vkCmdEndQueryIndexedEXT end_query_indexed = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     // Set only where a copy of timestamp results is not ordered after the timestamps written before it (MoltenVK on
@@ -3240,6 +3245,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.unpredicated_copies = 0;
     const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
                          vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
+    // An SO_STATISTICS query on a real transform-feedback heap additionally needs the indexed begin/end (D3D-302).
+    const bool so_queries = vk.begin_query_indexed && vk.end_query_indexed;
     // Vulkan allows one active query per type. Overlapping ordinary and binary occlusion share one physical
     // segment pool, and overlapping statistics split into the statistics pool (D3D-252); a physical query of a
     // type is still open at most once at any point, because each event closes the one open slot and opens a new
@@ -3784,7 +3791,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     overlaps |= begin && (ordinary_active || binary_active);
                     if (begin) ++binary_active; else --binary_active;
                 } else if (is_so_statistics(range.type)) {
-                    // No Vulkan query runs for it (QueryPool::pool is null), so it overlaps nothing.
+                    // A real transform-feedback heap queries on a stream (D3D-302); without a pool (the feature is
+                    // off) it overlaps nothing and runs nothing. Both cases are handled; the indexed commands are
+                    // required when the heap has a pool.
+                    if (heap->pool && !so_queries) return unsupported_at(__LINE__);
                 } else {
                     statistics_overlaps |= begin && statistics_active_count;
                     if (begin) ++statistics_active_count; else --statistics_active_count;
@@ -4227,17 +4237,28 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         begin_statistics();
         return;
     }
-    // A heap without a Vulkan pool (stream-output statistics: the layer has no stream output) runs nothing for
-    // BeginQuery and EndQuery; its resolves were planned as zero fills.
+    // A heap without a Vulkan pool (stream-output statistics on a device without VK_EXT_transform_feedback) runs
+    // nothing for BeginQuery and EndQuery; its resolves were planned as zero fills.
     if (!heap.pool && !std::holds_alternative<ResolveQueries>(command)) return;
+    // An SO_STATISTICS_STREAMn query begins/ends indexed on that stream (D3D-302): the query type's stream index is
+    // the `index` argument of vkCmdBeginQueryIndexedEXT / vkCmdEndQueryIndexedEXT.
+    const auto so_stream = [](std::uint32_t type) -> std::uint32_t {
+        return is_so_statistics(type) ? type - d3d12_query::so_statistics_stream0 : 0;
+    };
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
-        const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
-        vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        if (is_so_statistics(begin->type)) {
+            vk.begin_query_indexed(cb, heap.pool, begin->index, so_stream(begin->type), 0);
+        } else {
+            const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
+            vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        }
     } else if (const auto* end = std::get_if<EndQuery>(&command)) {
         if (end->type == d3d12_query::timestamp) {
             vk.reset_query_pool(cb, heap.pool, end->index, 1);
             vk.write_timestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
+        } else if (is_so_statistics(end->type)) {
+            vk.end_query_indexed(cb, heap.pool, end->index, so_stream(end->type));
         } else {
             vk.end_query(cb, heap.pool, end->index);
         }
