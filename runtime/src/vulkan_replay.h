@@ -4740,6 +4740,64 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                     checkpoints->record(command_buffer, i, CheckpointKind::draw);
             }
             const VkDeviceSize arguments = p.binding.buffer_offset + ind->argument_offset;
+            // Apply state arguments from the command signature before the indirect draw. D3D12 lets a
+            // signature carry VERTEX_BUFFER_VIEW and INDEX_BUFFER_VIEW arguments whose values live in the
+            // argument buffer; replay reads them and binds the corresponding buffers so the draw uses the
+            // right state. Argument offsets are walked in signature order; only host-readable argument
+            // buffers can be read here (DEFAULT/READBACK heaps are skipped with a log).
+            // D3D12_INDIRECT_ARGUMENT_TYPE values: DRAW=0, DRAW_INDEXED=1, DISPATCH=2, DISPATCH_MESH=4,
+            // VERTEX_BUFFER_VIEW=5, INDEX_BUFFER_VIEW=6, CONSTANT=7, CBV/SRV/UAV=8-10.
+            std::uint64_t arg_cursor = 0;
+            for (std::uint32_t arg_type : ind->argument_types) {
+                switch (arg_type) {
+                case 5: {  // VERTEX_BUFFER_VIEW
+                    // D3D12_VERTEX_BUFFER_VIEW: BufferLocation(u64), SizeInBytes(u32), StrideInBytes(u32)
+                    const std::uint64_t view_va = p.binding.va + ind->argument_offset + arg_cursor;
+                    const std::uint8_t* host = nullptr;
+                    if (vk.host_at(view_va, sizeof(std::uint64_t) + 2 * sizeof(std::uint32_t), host) == HostReadStatus::ok) {
+                        const std::uint64_t buffer_va = *reinterpret_cast<const std::uint64_t*>(host);
+                        std::uint64_t size = *reinterpret_cast<const std::uint32_t*>(host + sizeof(std::uint64_t));
+                        const std::uint32_t stride = *reinterpret_cast<const std::uint32_t*>(host + sizeof(std::uint64_t) + sizeof(std::uint32_t));
+                        VkBuffer vb = VK_NULL_HANDLE;
+                        VkDeviceSize vb_offset = 0;
+                        if (vk.buffer_at(buffer_va, size, vb, vb_offset)) {
+                            const VkDeviceSize vb_size = size;
+                            const VkDeviceSize vk_stride = stride;
+                            vk.bind_vertex_buffers2(command_buffer, 0, 1, &vb, &vb_offset, &vb_size, &vk_stride);
+                        }
+                    }
+                    arg_cursor += 16; // sizeof(D3D12_VERTEX_BUFFER_VIEW)
+                    break;
+                }
+                case 6: {  // INDEX_BUFFER_VIEW
+                    // D3D12_INDEX_BUFFER_VIEW: BufferLocation(u64), SizeInBytes(u32), Format(u32)
+                    const std::uint64_t view_va = p.binding.va + ind->argument_offset + arg_cursor;
+                    const std::uint8_t* host = nullptr;
+                    if (vk.host_at(view_va, sizeof(std::uint64_t) + 2 * sizeof(std::uint32_t), host) == HostReadStatus::ok) {
+                        const std::uint64_t buffer_va = *reinterpret_cast<const std::uint64_t*>(host);
+                        std::uint64_t size = *reinterpret_cast<const std::uint32_t*>(host + sizeof(std::uint64_t));
+                        const std::uint32_t format = *reinterpret_cast<const std::uint32_t*>(host + sizeof(std::uint64_t) + sizeof(std::uint32_t));
+                        VkBuffer ib = VK_NULL_HANDLE;
+                        VkDeviceSize ib_offset = 0;
+                        if (vk.buffer_at(buffer_va, size, ib, ib_offset)) {
+                            VkIndexType vk_format = (format == 57 /* DXGI_FORMAT_R16_UINT */) ? VK_INDEX_TYPE_UINT16 : VK_INDEX_TYPE_UINT32;
+                            vk.bind_index_buffer(command_buffer, ib, ib_offset, vk_format);
+                        }
+                    }
+                    arg_cursor += 16; // sizeof(D3D12_INDEX_BUFFER_VIEW)
+                    break;
+                }
+                case 0: arg_cursor += 16; break;  // DRAW
+                case 1: arg_cursor += 20; break;  // DRAW_INDEXED
+                case 2: arg_cursor += 12; break;  // DISPATCH
+                case 4: arg_cursor += 12; break;  // DISPATCH_MESH
+                case 7: arg_cursor += 4; break;   // CONSTANT
+                case 8:
+                case 9:
+                case 10: arg_cursor += 8; break;  // CBV/SRV/UAV
+                default: arg_cursor += 16; break;  // unknown / Xbox-only types: conservative stride
+                }
+            }
             if (ind->count_buffer && ind->kind != IndirectKind::dispatch) {
                 const VkDeviceSize count = p.source.buffer_offset + ind->count_offset;
                 if (ind->kind == IndirectKind::draw) {

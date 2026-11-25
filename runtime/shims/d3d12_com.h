@@ -60,9 +60,13 @@ HRESULT create_command_list(D3D12_COMMAND_LIST_TYPE type, ID3D12CommandAllocator
                             void** out, IUnknown* device = nullptr, ID3D12PipelineState* initial_state = nullptr);
 HRESULT create_fence(leonida::VulkanContext& context, UINT64 initial_value, D3D12_FENCE_FLAGS flags, REFIID riid,
                      void** out, IUnknown* device = nullptr);
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride,
+                                 std::span<const D3D12_INDIRECT_ARGUMENT_TYPE> argument_types,
+                                 ID3D12RootSignature* root_signature, REFIID riid, void** out,
                                  IUnknown* device = nullptr);
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride);
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            std::vector<D3D12_INDIRECT_ARGUMENT_TYPE>* argument_types = nullptr,
+                            ID3D12RootSignature** root_signature = nullptr);
 
 // ID3D12Device1::SetEventOnMultipleFenceCompletion on fences from create_fence: sets `event` once every fence
 // (D3D12_MULTIPLE_FENCE_WAIT_FLAG_ALL) or any fence (_ANY) has reached its value; a null event blocks until then.

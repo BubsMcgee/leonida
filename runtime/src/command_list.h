@@ -612,6 +612,10 @@ struct ExecuteIndirect {
     std::uint64_t argument_offset = 0;
     ResourceId count_buffer = 0;  // 0: fixed max_count; non-zero: vkCmdDraw*IndirectCount
     std::uint64_t count_offset = 0;
+    // The D3D12_INDIRECT_ARGUMENT_TYPE of each argument, in order, as declared by the command signature.
+    // Used by replay to apply vertex/index buffer views, root constants and descriptor views before
+    // the indirect draw or dispatch.
+    std::vector<std::uint32_t> argument_types;
     // kind == dispatch: the compute pipeline and root arguments in effect, as Dispatch records them, so the dispatches
     // run that pipeline with those arguments whatever the command buffer had bound. A pipeline of 0 leaves the binding
     // as it is.

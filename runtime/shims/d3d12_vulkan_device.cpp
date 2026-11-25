@@ -11734,6 +11734,12 @@ public:
         }
         if (desc->ByteStride % 4 || desc->ByteStride < size) return E_INVALIDARG;
         if (!out) return E_UNEXPECTED;  // the host's answer for a valid description and no output
+        // Collect argument types so the signature can replay vertex/index buffer views, root constants
+        // and descriptor views before the indirect draw.
+        std::vector<D3D12_INDIRECT_ARGUMENT_TYPE> argument_types;
+        argument_types.reserve(desc->NumArgumentDescs);
+        for (UINT i = 0; i < desc->NumArgumentDescs; ++i)
+            argument_types.push_back(desc->pArgumentDescs[i].Type);
         leonida::IndirectKind kind;
         switch (desc->pArgumentDescs[desc->NumArgumentDescs - 1].Type) {
         case D3D12_INDIRECT_ARGUMENT_TYPE_DRAW: kind = leonida::IndirectKind::draw; break;
@@ -11746,7 +11752,8 @@ public:
             break;
         default: return E_NOTIMPL;
         }
-        return create_command_signature(kind, desc->ByteStride, riid, out, identity());
+        return create_command_signature(kind, desc->ByteStride, argument_types, root_signature,
+                                        riid, out, identity());
     }
 
     void STDMETHODCALLTYPE GetRaytracingAccelerationStructurePrebuildInfo(

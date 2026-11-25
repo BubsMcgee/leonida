@@ -144,15 +144,25 @@ public:
     // {9a4e1c2b-55d8-4f7a-b012-3c8e7a1f6d90}
     static constexpr GUID kTag{0x9a4e1c2b, 0x55d8, 0x4f7a, {0xb0, 0x12, 0x3c, 0x8e, 0x7a, 0x1f, 0x6d, 0x90}};
 
-    CommandSignature(leonida::IndirectKind kind, UINT byte_stride) : kind_(kind), stride_(byte_stride) {}
+    // argument_types are the D3D12_INDIRECT_ARGUMENT_TYPE of each argument, in order. root_signature is
+    // required when any argument is a root constant or descriptor view; null otherwise.
+    CommandSignature(leonida::IndirectKind kind, UINT byte_stride,
+                     std::vector<D3D12_INDIRECT_ARGUMENT_TYPE> argument_types,
+                     ID3D12RootSignature* root_signature)
+        : kind_(kind), stride_(byte_stride),
+          argument_types_(std::move(argument_types)), root_signature_(root_signature) {}
 
     leonida::IndirectKind kind() const { return kind_; }
     UINT stride() const { return stride_; }
+    const std::vector<D3D12_INDIRECT_ARGUMENT_TYPE>& argument_types() const { return argument_types_; }
+    ID3D12RootSignature* root_signature() const { return root_signature_; }
     static CommandSignature* from(IUnknown* object) { return Child::from<CommandSignature>(object); }
 
 private:
     leonida::IndirectKind kind_;
     UINT stride_;
+    std::vector<D3D12_INDIRECT_ARGUMENT_TYPE> argument_types_;
+    ID3D12RootSignature* root_signature_ = nullptr;
 };
 
 class CommandAllocator final
@@ -957,7 +967,8 @@ public:
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
         leonida::IndirectKind kind = leonida::IndirectKind::draw;
         UINT stride = 0;
-        if (!command_signature_info(signature, kind, stride) || !argument_buffer)
+        std::vector<D3D12_INDIRECT_ARGUMENT_TYPE> argument_types;
+        if (!command_signature_info(signature, kind, stride, &argument_types) || !argument_buffer)
             return check(false);
         const auto arg_desc = argument_buffer->GetDesc();
         if (arg_desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER || argument_buffer_offset % 4 != 0)
@@ -1003,6 +1014,8 @@ public:
         leonida::ExecuteIndirect cmd{};
         cmd.kind = kind;
         cmd.stride = stride;
+        cmd.argument_types.reserve(argument_types.size());
+        for (auto t : argument_types) cmd.argument_types.push_back(std::uint32_t(t));
         cmd.max_count = max_command_count;
         cmd.argument_buffer = resource_id(argument_buffer);
         cmd.argument_offset = argument_buffer_offset;
@@ -2625,20 +2638,27 @@ bool queue_uses_calibrated_timestamps(ID3D12CommandQueue* queue) {
     return q && q->uses_calibrated_timestamps();
 }
 
-HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride, REFIID riid, void** out,
+HRESULT create_command_signature(leonida::IndirectKind kind, UINT byte_stride,
+                                 std::span<const D3D12_INDIRECT_ARGUMENT_TYPE> argument_types,
+                                 ID3D12RootSignature* root_signature, REFIID riid, void** out,
                                  IUnknown* device) {
     if (!out) return E_POINTER;
     *out = nullptr;
-    auto* sig = new CommandSignature(kind, byte_stride);
+    std::vector<D3D12_INDIRECT_ARGUMENT_TYPE> types(argument_types.begin(), argument_types.end());
+    auto* sig = new CommandSignature(kind, byte_stride, std::move(types), root_signature);
     sig->attach_device(device);
     return hand_out(sig, riid, out);
 }
 
-bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride) {
+bool command_signature_info(ID3D12CommandSignature* signature, leonida::IndirectKind& kind, UINT& byte_stride,
+                            std::vector<D3D12_INDIRECT_ARGUMENT_TYPE>* argument_types,
+                            ID3D12RootSignature** root_signature) {
     const CommandSignature* s = CommandSignature::from(signature);
     if (!s) return false;
     kind = s->kind();
     byte_stride = s->stride();
+    if (argument_types) *argument_types = s->argument_types();
+    if (root_signature) *root_signature = s->root_signature();
     return true;
 }
 
