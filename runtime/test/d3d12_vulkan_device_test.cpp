@@ -6766,8 +6766,10 @@ int main() {
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&timestamps.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_OCCLUSION, 0, 0};
             EXPECT(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&refused.p)) == E_INVALIDARG && !refused.p);
-            // The layer has no stream output, so stream-output statistics heaps are made without a Vulkan pool and
-            // every query reads zero (D3D-302).
+            // D3D-302: an SO_STATISTICS heap is a real transform-feedback pool on a device with
+            // VK_EXT_transform_feedback (indexed on the stream); without it the layer has no stream output, the heap
+            // is made without a Vulkan pool, and every query reads zero. No stream output runs in either case here,
+            // so the resolved counts are 0.
             query_desc = {D3D12_QUERY_HEAP_TYPE_SO_STATISTICS, 3, 0};
             EXPECT(SUCCEEDED(device->CreateQueryHeap(&query_desc, IID_PPV_ARGS(&so.p))));
             query_desc = {D3D12_QUERY_HEAP_TYPE_PIPELINE_STATISTICS, 2, 0};
@@ -6811,6 +6813,13 @@ int main() {
             list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 0, 1, readback.p, occlusion_at);
             list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_BINARY_OCCLUSION, 1, 1, readback.p, occlusion_at + 8);
             list->ResolveQueryData(occlusion.p, D3D12_QUERY_TYPE_OCCLUSION, 2, 2, readback.p, occlusion_at + 16);
+            // SOSetTargets (D3D-302) records a stream-output buffer view; no StreamOutput PSO is bound here, so the
+            // draw capture path is not exercised, but the call must record and the list must still close.
+            D3D12_STREAM_OUTPUT_BUFFER_VIEW so_view{};
+            so_view.BufferLocation = 0x1000;  // a console VA that names no buffer; no draw reads it in this list
+            so_view.SizeInBytes = 256;
+            list->SOSetTargets(0, 1, &so_view);
+            list->SOSetTargets(1, 1, nullptr);  // unbind
             if (statistics.p)
                 list->ResolveQueryData(statistics.p, D3D12_QUERY_TYPE_PIPELINE_STATISTICS, 0, 2, readback.p,
                                        statistics_at);

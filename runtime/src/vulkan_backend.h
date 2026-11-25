@@ -121,7 +121,9 @@ struct VulkanDeviceFunctions {
     X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) X(vkMergePipelineCaches)   \
     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
-    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+    X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)                                                           \
+    X(vkCmdBeginQueryIndexedEXT) X(vkCmdEndQueryIndexedEXT)                                                  \
+    X(vkCmdBindTransformFeedbackBuffersEXT) X(vkCmdBeginTransformFeedbackEXT) X(vkCmdEndTransformFeedbackEXT)
 #define LEONIDA_VK_MEMBER(name) PFN_##name name = nullptr;
     LEONIDA_VK_DEVICE_FUNCTIONS(LEONIDA_VK_MEMBER)
 #undef LEONIDA_VK_MEMBER
@@ -156,6 +158,9 @@ struct VulkanDeviceFunctions {
         return vkCmdBeginRendering && vkCmdEndRendering && vkCmdBindVertexBuffers2 && vkCmdSetPrimitiveTopology &&
                vkCmdSetPrimitiveRestartEnable;
     }
+    // VK_EXT_transform_feedback is enabled on the device: the indexed-query and transform-feedback entry points are
+    // loaded, so StreamOutput PSOs and SO_STATISTICS queries work (D3D-302).
+    bool transform_feedback = false;
 };
 
 // Both kinds of compute resolve use the same storage buffer, descriptor set and pipeline layout.
@@ -994,6 +999,9 @@ public:
                   bool conditional_rendering = false, bool ray_tracing = false, bool xdxr = false)
         : device_(device), tracker_(separate_depth_stencil_layouts), ray_tracing_(ray_tracing) {
         loaded_ = vk.load(get, device);
+        // VK_EXT_transform_feedback: enabled on the device when its entry points resolved (D3D-302).
+        vk.transform_feedback = vk.vkCmdBeginTransformFeedbackEXT && vk.vkCmdEndTransformFeedbackEXT &&
+                                vk.vkCmdBindTransformFeedbackBuffersEXT;
         if (loaded_ && gpu_labels_.initialize(device, get)) {
             replay_.gpu_label = [this](VkCommandBuffer cb, const label::Write& write) { gpu_labels_.record(cb, write); };
         }
@@ -1024,6 +1032,15 @@ public:
         replay_.reset_query_pool = vk.vkCmdResetQueryPool;
         replay_.begin_query = vk.vkCmdBeginQuery;
         replay_.end_query = vk.vkCmdEndQuery;
+        // VK_EXT_transform_feedback (D3D-302), loaded when the device enabled it (transform_feedback_): indexed
+        // SO_STATISTICS queries and transform-feedback capture around StreamOutput draws.
+        if (vk.transform_feedback) {
+            replay_.begin_query_indexed = vk.vkCmdBeginQueryIndexedEXT;
+            replay_.end_query_indexed = vk.vkCmdEndQueryIndexedEXT;
+            replay_.bind_transform_feedback_buffers = vk.vkCmdBindTransformFeedbackBuffersEXT;
+            replay_.begin_transform_feedback = vk.vkCmdBeginTransformFeedbackEXT;
+            replay_.end_transform_feedback = vk.vkCmdEndTransformFeedbackEXT;
+        }
         replay_.write_timestamp = vk.vkCmdWriteTimestamp;
         replay_.copy_query_pool_results = vk.vkCmdCopyQueryPoolResults;
         replay_.bind_pipeline = vk.vkCmdBindPipeline;
