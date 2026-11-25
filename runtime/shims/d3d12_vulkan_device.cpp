@@ -61,6 +61,7 @@
 #include "../src/spirv_stores.h"
 #include "../src/title_va_alias.h"
 #include "../src/title_window_plan.h"
+#include "../src/title_write_back.h"
 #include "../src/vulkan_present.h"
 #include "../src/vulkan_device_filter.h"
 #include "../src/vulkan13_features.h"
@@ -2112,6 +2113,54 @@ struct DeviceState {
     }
     // heaps / pages: whether this submission refreshes the console heaps and the slot-133 shadows and title windows
     // (LEONIDA_REFRESH_PER_FRAME leaves some submissions without them).
+    // LEONIDA_TITLE_WRITE_BACK=1: a GPU write into a title window (a buffer view that names the title's pages) is
+    // copied back to the title's own pages after the submission. Off by default while it is validated on the title.
+    static bool title_write_back_enabled() {
+        static const bool enabled = [] {
+            char text[8]{};
+            std::size_t length = 0;
+            return getenv_s(&length, text, sizeof(text), "LEONIDA_TITLE_WRITE_BACK") == 0 && length > 1 &&
+                   text[0] != '0';
+        }();
+        return enabled;
+    }
+
+    // Called by the view writer when a buffer view that reaches the title's pages is made (see flush_title_write_backs).
+    void mark_title_write(std::uintptr_t va, std::size_t bytes) {
+        if (title_write_back_enabled()) title_write_back.mark(va, bytes);
+    }
+
+    // Called after the copies are refreshed for this submission. The GPU that wrote a marked range has finished, and
+    // every page the title wrote since is already in the copy (the refresh put it there), so copying a page back
+    // cannot lose a title write. Pages the title has no readable mapping for are left alone.
+    void flush_title_write_backs() {
+        if (!title_write_back_enabled() || title_write_back.empty()) return;
+        const std::vector<leonida::title_write_back::Range> ranges = title_write_back.take();
+        if (!context || context->is_device_lost()) return;
+        if (context->observe_result(context->vk.vkDeviceWaitIdle(info.device), "vkDeviceWaitIdle") != VK_SUCCESS)
+            return;
+        std::uint64_t copied = 0;
+        for (const auto& r : ranges) {
+            const std::uintptr_t first = r.title_va, last = r.title_va + r.bytes;
+            for (std::uintptr_t at = first; at < last;) {
+                const std::uintptr_t stop = std::min(last, (at + ShadowPages::kPage) & ~(ShadowPages::kPage - 1));
+                if (readable_page(at)) {
+                    std::memcpy(reinterpret_cast<void*>(at), r.shadow + (at - first), std::size_t(stop - at));
+                    copied += stop - at;
+                }
+                at = stop;
+            }
+        }
+        if (copied) {
+            static std::atomic<std::uint64_t> total{0};
+            const std::uint64_t n = total.fetch_add(copied, std::memory_order_relaxed) + copied;
+            std::fprintf(stderr,
+                         "[rt] d3d12: title write-back: %llu KiB of shader writes copied to the title's pages (%llu "
+                         "KiB so far)\n",
+                         static_cast<unsigned long long>(copied >> 10), static_cast<unsigned long long>(n >> 10));
+        }
+    }
+
     void refresh_shadows(bool heaps = true, bool pages = true) {
         using clock = std::chrono::steady_clock;
         // First, and without shadow_mutex: fixing a console heap's slots can make a title window (add_shadow).
@@ -2218,6 +2267,8 @@ struct DeviceState {
     static constexpr std::uint64_t kPoolExtentMax = 1ull << 20;
     std::mutex title_window_mutex;  // taken before shadow_mutex, never under it
     rt::d3d12::TitleBufferWindows external_windows;
+    // Title windows a GPU write may reach, and the ranges written since the last copy-back (LEONIDA_TITLE_WRITE_BACK).
+    leonida::title_write_back::Registry title_write_back;
     std::vector<TitleWindow> title_windows;
     std::atomic<std::size_t> title_window_count{0};  // title_windows.size(), read without the mutex
     std::uint64_t title_window_bytes = 0;
@@ -2335,6 +2386,7 @@ struct DeviceState {
         if (offset >= arena.size) backing(arena.address + offset, size, start, true);
         const auto* pages = reinterpret_cast<const std::uint8_t*>(static_cast<std::uintptr_t>(start));
         add_shadow(pages, mapped, std::size_t(size));
+        if (title_write_back_enabled()) title_write_back.add_window(start, mapped, std::size_t(size));
         title_windows.push_back({start, offset});
         title_window_count.store(title_windows.size(), std::memory_order_relaxed);
         title_window_bytes += size;
@@ -10869,6 +10921,7 @@ public:
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
             state_.refresh_shadows(full || per_frame < 2, full);
+            state_.flush_title_write_backs();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
             // thread (speed-27: 230-330 ms a refresh after the load, a VirtualQuery and VirtualProtect per written
@@ -14289,6 +14342,9 @@ public:
         }
         const UINT64 va = resource->GetGPUVirtualAddress();
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
+        // A shader writing through this view reaches the title's pages: have the copy they live in brought back to
+        // them after the submission (title windows only; a slot-133 copy is not registered here).
+        state_.mark_title_write(std::uintptr_t(va), std::size_t(rd.Width));
         if (!va || (counter && !counter_va)) return;
         write_buffer_uav_at(va, rd.Width, desc, counter ? counter_va + desc->Buffer.CounterOffsetInBytes : 0,
                             destination);
