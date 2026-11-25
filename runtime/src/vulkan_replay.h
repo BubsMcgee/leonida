@@ -1241,12 +1241,15 @@ struct PreparedDraw {
     VkDeviceSize index_offset = 0;
     VkDeviceSize index_size = 0;  // the bytes of the index buffer view inside its buffer; 0 with no index buffer
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
-    // Stream output (D3D-302): the capture buffers SOSetTargets bound, resolved from their VAs. Only slots with a
-    // buffer are used (by input slot). The filled-size location (BufferFilledSizeLocation) is a write-back follow-up
-    // (docs/d3d12_vulkan.md section 4.6).
+    // Stream output (D3D-302): the capture buffers SOSetTargets bound, resolved from their VAs, by input slot. Only
+    // slots with a buffer are bound (a null slot is filled with a zero-size binding at emit). The filled-size
+    // location (BufferFilledSizeLocation) is the byte offset a capture resumes from and is written back after the
+    // draw, which is exactly a Vulkan counter buffer, so it is resolved too (docs/d3d12_vulkan.md section 4.6).
     std::array<VkBuffer, so_buffer_slot_count> stream_output{};
     std::array<VkDeviceSize, so_buffer_slot_count> stream_output_offsets{};
     std::array<VkDeviceSize, so_buffer_slot_count> stream_output_sizes{};
+    std::array<VkBuffer, so_buffer_slot_count> stream_output_counters{};
+    std::array<VkDeviceSize, so_buffer_slot_count> stream_output_counter_offsets{};
     QuadIndexExpansion quad_indices;  // an indexed quad list: the triangle indices its draw binds instead
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
@@ -1272,6 +1275,8 @@ struct PreparedDraw {
         stream_output.fill(VK_NULL_HANDLE);
         stream_output_offsets.fill(0);
         stream_output_sizes.fill(0);
+        stream_output_counters.fill(VK_NULL_HANDLE);
+        stream_output_counter_offsets.fill(0);
         quad_indices = {};
         area = {};
         layers = 1;
@@ -2549,9 +2554,11 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.index_size = size;
         }
     }
-    // Stream output (D3D-302): resolve each bound capture buffer from its VA, like the vertex buffers. Without a
-    // bound buffer the slot is left null. The filled-size location is a separate VA (written after the draw).
-    if (vk.begin_transform_feedback) {
+    // Stream output (D3D-302): resolve each bound capture buffer from its VA, like the vertex buffers, but only for
+    // a pipeline that captures: a stale SO target left bound must not make an ordinary draw unresolvable. Without a
+    // bound buffer the slot is left null. The filled-size location is a separate VA holding the byte offset the
+    // capture resumes from and appends to, so it resolves to the counter buffer that begin/end read and write back.
+    if (pipeline->stream_output && vk.begin_transform_feedback) {
         for (std::uint32_t slot = 0; slot < so_buffer_slot_count; ++slot) {
             const StreamOutputBufferView& view = draw.stream_output[slot];
             if (!view.valid()) continue;
@@ -2570,6 +2577,23 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             }
             p.stream_output_offsets[slot] = offset;
             p.stream_output_sizes[slot] = size;
+            // A missing count location only loses the append position (the capture still starts at byte 0), so it
+            // is not fatal. D3D12 always supplies one; a null slot has no counter.
+            if (view.filled_size_va) {
+                VkDeviceSize counter_offset = 0;
+                std::uint64_t counter_size = 4;
+                if (vk.buffer_at(view.filled_size_va, counter_size, p.stream_output_counters[slot], counter_offset) ||
+                    (vk.title_memory && vk.title_memory(view.filled_size_va, 4, p.stream_output_counters[slot],
+                                                         counter_offset))) {
+                    p.stream_output_counter_offsets[slot] = counter_offset;
+                } else {
+                    static std::atomic<unsigned> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 24)
+                        std::fprintf(stderr,
+                                     "[rt] replay: stream output filled-size slot %u va 0x%llx names no buffer\n",
+                                     slot, static_cast<unsigned long long>(view.filled_size_va));
+                }
+            }
         }
     }
     return ReplayResult::success;
@@ -4952,21 +4976,42 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             // Stream output (D3D-302): bind the capture buffers SOSetTargets set, then capture this draw's
             // primitives into them. Capture runs only when the bound pipeline declares StreamOutput (beginning
             // transform feedback without one is a Vulkan VUID violation); a StreamOutput draw with no bound buffer
-            // is captured into nothing, as D3D12 does with no bound buffer.
+            // is captured into nothing, as D3D12 does with no bound buffer. Every binding in the call must name a
+            // buffer, so a gap between bound slots is filled with the first bound buffer at size 0 (nothing is
+            // captured into it). The filled-size counters make consecutive draws append instead of overwrite.
             const auto begin_stream_output = [&]() -> std::uint32_t {
                 if (!graphics.stream_output || !vk.bind_transform_feedback_buffers || !vk.begin_transform_feedback)
                     return 0;
                 std::uint32_t count = 0;
-                for (std::uint32_t slot = 0; slot < so_buffer_slot_count; ++slot)
-                    if (d.stream_output[slot]) count = slot + 1;
+                VkBuffer first = VK_NULL_HANDLE;
+                for (std::uint32_t slot = 0; slot < so_buffer_slot_count; ++slot) {
+                    if (!d.stream_output[slot]) continue;
+                    if (!first) first = d.stream_output[slot];
+                    count = slot + 1;
+                }
                 if (!count) return 0;
-                vk.bind_transform_feedback_buffers(command_buffer, 0, count, d.stream_output.data(),
-                                                    d.stream_output_offsets.data(), d.stream_output_sizes.data());
-                vk.begin_transform_feedback(command_buffer, 0, count, nullptr, nullptr);
+                std::array<VkBuffer, so_buffer_slot_count> buffers{};
+                std::array<VkDeviceSize, so_buffer_slot_count> offsets{};
+                std::array<VkDeviceSize, so_buffer_slot_count> sizes{};
+                for (std::uint32_t slot = 0; slot < count; ++slot) {
+                    if (d.stream_output[slot]) {
+                        buffers[slot] = d.stream_output[slot];
+                        offsets[slot] = d.stream_output_offsets[slot];
+                        sizes[slot] = d.stream_output_sizes[slot];
+                    } else {
+                        buffers[slot] = first;
+                    }
+                }
+                vk.bind_transform_feedback_buffers(command_buffer, 0, count, buffers.data(), offsets.data(),
+                                                    sizes.data());
+                vk.begin_transform_feedback(command_buffer, 0, count, d.stream_output_counters.data(),
+                                            d.stream_output_counter_offsets.data());
                 return count;
             };
             const auto end_stream_output = [&](std::uint32_t count) {
-                if (count) vk.end_transform_feedback(command_buffer, 0, count, nullptr, nullptr);
+                if (count)
+                    vk.end_transform_feedback(command_buffer, 0, count, d.stream_output_counters.data(),
+                                              d.stream_output_counter_offsets.data());
             };
             const std::uint32_t stream_output_count = begin_stream_output();
             if (draw->mesh) {

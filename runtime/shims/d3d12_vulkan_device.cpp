@@ -2320,6 +2320,9 @@ struct DeviceState {
                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                        VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (info.conditional_rendering) result.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (info.transform_feedback)
+            result.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                            VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         // D3D12 reserved buffers are visible to DIRECT, COPY and COMPUTE queues without exposing Vulkan
         // queue-family ownership. Their tile bindings and accesses may use distinct families, so match the
         // CONCURRENT sharing policy used for ordinary buffers and the GPU address arena.
@@ -2659,6 +2662,9 @@ struct DeviceState {
         create.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
                        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                        VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+        if (info.transform_feedback)
+            create.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                            VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         share(create);
         if (vk.vkCreateBuffer(info.device, &create, nullptr, &heap.buffer) != VK_SUCCESS) return false;
         const auto fail = [&] {
@@ -4712,6 +4718,9 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (device_.info.transform_feedback)
+            info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         if (addressable || need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         if (device_.info.ray_tracing) {
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
@@ -4846,6 +4855,9 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (device_.info.transform_feedback)
+            info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         device_.share(info);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
@@ -4988,6 +5000,9 @@ public:
                      VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
         if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (device_.info.transform_feedback)
+            info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         device_.share(info);
         if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
@@ -7587,7 +7602,8 @@ public:
                 return stream_unsupported("target-independent rasterization; forced sample count", int(r.ForcedSampleCount));
         }
         VkPipelineRasterizationStateCreateInfo raster{VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO};
-        VkPipelineRasterizationStateStreamCreateInfoEXT rasterization_stream{};
+        VkPipelineRasterizationStateStreamCreateInfoEXT rasterization_stream{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT};
         raster.polygonMode = r.FillMode == D3D12_FILL_MODE_WIREFRAME ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
         raster.cullMode = r.CullMode == D3D12_CULL_MODE_FRONT  ? VK_CULL_MODE_FRONT_BIT
                           : r.CullMode == D3D12_CULL_MODE_BACK ? VK_CULL_MODE_BACK_BIT
@@ -8168,7 +8184,8 @@ private:
         VkPipelineRasterizationStateCreateInfo raster{};
         // A StreamOutput RasterizedStream other than 0: chained to `raster` so the geometry/vertex stage feeds the
         // rasterizer from that stream (D3D-302). Stream 0 needs no struct (Vulkan's default).
-        VkPipelineRasterizationStateStreamCreateInfoEXT rasterization_stream{};
+        VkPipelineRasterizationStateStreamCreateInfoEXT rasterization_stream{
+            VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_STREAM_CREATE_INFO_EXT};
         bool stream_output = false;
         bool conservative = false;
         VkPipelineMultisampleStateCreateInfo multisample{};
@@ -10198,6 +10215,9 @@ public:
                      VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
         // Default-heap buffers live here, and any of them can be a SetPredication buffer.
         if (state_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
+        if (state_.info.transform_feedback)
+            info.usage |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT |
+                          VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
         // With ray tracing, AS result, scratch and build-input buffers are default-heap ranges of the arena.
         if (state_.info.ray_tracing)
             info.usage |= VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_STORAGE_BIT_KHR |
