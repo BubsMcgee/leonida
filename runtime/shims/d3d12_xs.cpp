@@ -231,7 +231,7 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
     if (!create) return result(method, E_NOTIMPL);
 
     ID3D12Device* real = nullptr;
-    HRESULT hr = rt::d3d12_xs::create_host_device(create, adapter, &real);
+    HRESULT hr = rt::d3d12_xs::create_host_device(create, adapter, kHostDeviceFloor, &real);
     if (FAILED(hr)) {
         std::fprintf(stderr, "[rt] d3d12_xs: D3D12XboxCreateDevice: PC D3D12CreateDevice failed (hr=0x%08lx)\n",
                      static_cast<unsigned long>(hr));

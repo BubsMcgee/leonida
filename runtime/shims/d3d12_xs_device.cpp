@@ -6308,18 +6308,19 @@ D3D_FEATURE_LEVEL max_feature_level(ID3D12Device* device) {
     return levels.MaxSupportedFeatureLevel;
 }
 
-HRESULT create_host_device(HostCreateDeviceFn create, IUnknown* adapter, ID3D12Device** out) {
+HRESULT create_host_device(HostCreateDeviceFn create, IUnknown* adapter, D3D_FEATURE_LEVEL minimum, ID3D12Device** out) {
     if (!out) return E_POINTER;
     *out = nullptr;
     if (!create) return E_NOTIMPL;
     ID3D12Device* device = nullptr;
-    const HRESULT hr = create(adapter, kHostDeviceFloor, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
+    const HRESULT hr = create(adapter, minimum, __uuidof(ID3D12Device), reinterpret_cast<void**>(&device));
     if (FAILED(hr) || !device) {
         if (device) device->Release();
         return FAILED(hr) ? hr : E_FAIL;
     }
     const D3D_FEATURE_LEVEL level = max_feature_level(device);
-    std::fprintf(stderr, "[rt] d3d12_xs: host device created at minimum feature level 11_0; highest level %u_%u\n",
+    std::fprintf(stderr, "[rt] d3d12_xs: host device created at minimum feature level %u_%u; highest level %u_%u\n",
+                 unsigned(minimum) >> 12, (unsigned(minimum) >> 8) & 0xf,
                  unsigned(level) >> 12, (unsigned(level) >> 8) & 0xf);
     *out = device;
     return S_OK;
