@@ -427,6 +427,21 @@ public:
         set_index_buffer(view);
     }
 
+    // Stream output (D3D-302): binds capture buffers for the streams the bound StreamOutput pipeline declares.
+    // A null view unbinds its slot. The views are captured into each Draw, so a later call cannot change a recorded
+    // draw. Each view's BufferLocation and BufferFilledSizeLocation are GPU VAs.
+    void STDMETHODCALLTYPE SOSetTargets(UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) override {
+        if (list_.closed()) return;
+        if (std::uint64_t(start) + count > stream_output_.size()) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> copy;
+            if (views) copy.assign(views, views + count);
+            defer([=, copy = std::move(copy)](GraphicsCommandList& l) { l.set_stream_output(start, count, copy.data()); });
+            return;
+        }
+        set_stream_output(start, count, views);
+    }
+
     // A count of 0 unbinds the viewports; draws then rasterize nothing (record_draw).
     void STDMETHODCALLTYPE RSSetViewports(UINT count, const D3D12_VIEWPORT* viewports) override {
         if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) return check(false);
@@ -1523,6 +1538,8 @@ private:
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
     leonida::IndexBufferView index_{};
+    // Stream output targets (D3D-302): the buffer views SOSetTargets bound, captured into each Draw.
+    std::array<leonida::StreamOutputBufferView, D3D12_SO_BUFFER_SLOT_COUNT> stream_output_{};
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
     bool directly_indexed_ = false;
@@ -1672,6 +1689,19 @@ private:
         if (view) leonida::title_va_aliases().want_buffer(view->BufferLocation, view->SizeInBytes);
         index_ = view ? leonida::IndexBufferView{view->BufferLocation, view->SizeInBytes, u(view->Format)}
                       : leonida::IndexBufferView{};
+    }
+
+    // D3D-302: store the stream-output buffer views SOSetTargets bound. A null view unbinds its slot.
+    void set_stream_output(UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) {
+        for (UINT i = 0; i < count; ++i) {
+            if (views) {
+                stream_output_[start + i] = leonida::StreamOutputBufferView{views[i].BufferLocation,
+                                                                            views[i].SizeInBytes,
+                                                                            views[i].BufferFilledSizeLocation};
+            } else {
+                stream_output_[start + i] = {};
+            }
+        }
     }
 
     // The compiled console ABI appends directly indexed heaps after the explicit root arguments: the resource heap's
@@ -1907,6 +1937,7 @@ private:
         leonida::Draw draw{graphics_pipeline_, graphics_user_data(), draw_views(), depth_, index_, topology_, viewport_,
                            scissor_, blend_factor_, front_stencil_ref_, back_stencil_ref_, indexed, count, instances,
                            first, base_vertex, first_instance};
+        draw.stream_output = stream_output_;
         draw.viewports = draw_viewports();
         check(list_.draw(std::move(draw)));
     }

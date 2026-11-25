@@ -781,8 +781,9 @@ struct OcclusionResult {
 // A D3D12 query heap on Vulkan. The host tracks which queries hold a result. A resolve of a query that
 // was never ended writes zeros instead of waiting on it.
 struct QueryPool {
-    // Null for a stream-output statistics heap: the layer has no stream output (PSOs with StreamOutput entries are
-    // refused), so every SO_STATISTICS_STREAMn query counts 0 written and 0 needed, and a resolve fills zeros.
+    // Null for a stream-output statistics heap on a device without VK_EXT_transform_feedback (D3D-302): every
+    // SO_STATISTICS_STREAMn query then counts 0 written and 0 needed, and a resolve fills zeros. With the feature
+    // it is a VK_QUERY_TYPE_TRANSFORM_FEEDBACK_STREAM_EXT pool, begun/ended indexed on the stream.
     VkQueryPool pool = VK_NULL_HANDLE;
     std::uint32_t heap_type = 0;  // d3d12_query_heap
     std::uint32_t count = 0;
@@ -821,6 +822,7 @@ struct GraphicsPipeline {
     std::uint32_t zero_step_slots = 0;    // per-instance slots with InstanceDataStepRate 0: stride 0 at draw time
     std::uint32_t strip_cut = 0;          // D3D12_INDEX_BUFFER_STRIP_CUT_VALUE (0: off, 1: 0xFFFF, 2: 0xFFFFFFFF)
     bool mesh = false;                    // a mesh shader instead of a vertex shader: drawn by DispatchMesh only
+    bool stream_output = false;           // the PSO declares StreamOutput (D3D-302): draws capture with transform feedback
     bool viewport_with_count = false;     // pipeline uses VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT / SCISSOR_WITH_COUNT
     // The same pipeline with some attachment formats VK_FORMAT_UNDEFINED, for a draw that leaves those slots
     // unbound (D3D12 allows it; dynamic rendering needs the formats to agree). Bit i: colour slot i, bit 8: depth
@@ -948,6 +950,13 @@ struct ReplayFunctions {
     PFN_vkCmdResetQueryPool reset_query_pool = nullptr;  // queries, with fill_buffer for unavailable results
     PFN_vkCmdBeginQuery begin_query = nullptr;
     PFN_vkCmdEndQuery end_query = nullptr;
+    // VK_EXT_transform_feedback (D3D-302): SO_STATISTICS queries begin/end indexed on a stream, and a draw bound to a
+    // StreamOutput pipeline captures through begin/end transform feedback. Null when the device lacks the feature.
+    PFN_vkCmdBeginQueryIndexedEXT begin_query_indexed = nullptr;
+    PFN_vkCmdEndQueryIndexedEXT end_query_indexed = nullptr;
+    PFN_vkCmdBindTransformFeedbackBuffersEXT bind_transform_feedback_buffers = nullptr;
+    PFN_vkCmdBeginTransformFeedbackEXT begin_transform_feedback = nullptr;
+    PFN_vkCmdEndTransformFeedbackEXT end_transform_feedback = nullptr;
     PFN_vkCmdWriteTimestamp write_timestamp = nullptr;
     PFN_vkCmdCopyQueryPoolResults copy_query_pool_results = nullptr;
     // Set only where a copy of timestamp results is not ordered after the timestamps written before it (MoltenVK on
@@ -1232,6 +1241,12 @@ struct PreparedDraw {
     VkDeviceSize index_offset = 0;
     VkDeviceSize index_size = 0;  // the bytes of the index buffer view inside its buffer; 0 with no index buffer
     VkIndexType index_type = VK_INDEX_TYPE_UINT16;
+    // Stream output (D3D-302): the capture buffers SOSetTargets bound, resolved from their VAs. Only slots with a
+    // buffer are used (by input slot). The filled-size location (BufferFilledSizeLocation) is a write-back follow-up
+    // (docs/d3d12_vulkan.md section 4.6).
+    std::array<VkBuffer, so_buffer_slot_count> stream_output{};
+    std::array<VkDeviceSize, so_buffer_slot_count> stream_output_offsets{};
+    std::array<VkDeviceSize, so_buffer_slot_count> stream_output_sizes{};
     QuadIndexExpansion quad_indices;  // an indexed quad list: the triangle indices its draw binds instead
     VkExtent2D area{};
     std::uint32_t layers = 1;  // the fewest layers any bound attachment view has
@@ -1254,6 +1269,9 @@ struct PreparedDraw {
         index_offset = 0;
         index_size = 0;
         index_type = VK_INDEX_TYPE_UINT16;
+        stream_output.fill(VK_NULL_HANDLE);
+        stream_output_offsets.fill(0);
+        stream_output_sizes.fill(0);
         quad_indices = {};
         area = {};
         layers = 1;
@@ -2531,6 +2549,29 @@ ReplayResult prepare_draw(const Draw& draw, Resolve&& resolve, const ReplayFunct
             p.index_size = size;
         }
     }
+    // Stream output (D3D-302): resolve each bound capture buffer from its VA, like the vertex buffers. Without a
+    // bound buffer the slot is left null. The filled-size location is a separate VA (written after the draw).
+    if (vk.begin_transform_feedback) {
+        for (std::uint32_t slot = 0; slot < so_buffer_slot_count; ++slot) {
+            const StreamOutputBufferView& view = draw.stream_output[slot];
+            if (!view.valid()) continue;
+            std::uint64_t size = view.size;
+            VkDeviceSize offset = 0;
+            if (!vk.buffer_at(view.buffer_va, size, p.stream_output[slot], offset)) {
+                size = view.size;
+                if (!vk.title_memory || !vk.title_memory(view.buffer_va, size, p.stream_output[slot], offset)) {
+                    static std::atomic<unsigned> logged{0};
+                    if (logged.fetch_add(1, std::memory_order_relaxed) < 24)
+                        std::fprintf(stderr,
+                                     "[rt] replay: stream output buffer slot %u va 0x%llx size %u names no buffer\n",
+                                     slot, static_cast<unsigned long long>(view.buffer_va), unsigned(view.size));
+                    return unresolved_at(__LINE__);
+                }
+            }
+            p.stream_output_offsets[slot] = offset;
+            p.stream_output_sizes[slot] = size;
+        }
+    }
     return ReplayResult::success;
 }
 
@@ -2970,6 +3011,8 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
     out.unpredicated_copies = 0;
     const bool queries = vk.reset_query_pool && vk.begin_query && vk.end_query && vk.write_timestamp &&
                          vk.copy_query_pool_results && vk.fill_buffer && vk.query_pool;
+    // An SO_STATISTICS query on a real transform-feedback heap additionally needs the indexed begin/end (D3D-302).
+    const bool so_queries = vk.begin_query_indexed && vk.end_query_indexed;
     // Vulkan allows one active query per type. Overlapping ordinary and binary occlusion share one physical
     // segment pool, and overlapping statistics split into the statistics pool (D3D-252); a physical query of a
     // type is still open at most once at any point, because each event closes the one open slot and opens a new
@@ -3499,7 +3542,10 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
                     overlaps |= begin && (ordinary_active || binary_active);
                     if (begin) ++binary_active; else --binary_active;
                 } else if (is_so_statistics(range.type)) {
-                    // No Vulkan query runs for it (QueryPool::pool is null), so it overlaps nothing.
+                    // A real transform-feedback heap queries on a stream (D3D-302); without a pool (the feature is
+                    // off) it overlaps nothing and runs nothing. Both cases are handled; the indexed commands are
+                    // required when the heap has a pool.
+                    if (heap->pool && !so_queries) return unsupported_at(__LINE__);
                 } else {
                     statistics_overlaps |= begin && statistics_active_count;
                     if (begin) ++statistics_active_count; else --statistics_active_count;
@@ -3909,17 +3955,28 @@ inline void emit_query(const PreparedList& list, const detail::PreparedQuery& qu
         begin_statistics();
         return;
     }
-    // A heap without a Vulkan pool (stream-output statistics: the layer has no stream output) runs nothing for
-    // BeginQuery and EndQuery; its resolves were planned as zero fills.
+    // A heap without a Vulkan pool (stream-output statistics on a device without VK_EXT_transform_feedback) runs
+    // nothing for BeginQuery and EndQuery; its resolves were planned as zero fills.
     if (!heap.pool && !std::holds_alternative<ResolveQueries>(command)) return;
+    // An SO_STATISTICS_STREAMn query begins/ends indexed on that stream (D3D-302): the query type's stream index is
+    // the `index` argument of vkCmdBeginQueryIndexedEXT / vkCmdEndQueryIndexedEXT.
+    const auto so_stream = [](std::uint32_t type) -> std::uint32_t {
+        return is_so_statistics(type) ? type - d3d12_query::so_statistics_stream0 : 0;
+    };
     if (const auto* begin = std::get_if<BeginQuery>(&command)) {
         vk.reset_query_pool(cb, heap.pool, begin->index, 1);
-        const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
-        vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        if (is_so_statistics(begin->type)) {
+            vk.begin_query_indexed(cb, heap.pool, begin->index, so_stream(begin->type), 0);
+        } else {
+            const bool precise = begin->type == d3d12_query::occlusion && heap.precise;
+            vk.begin_query(cb, heap.pool, begin->index, precise ? VK_QUERY_CONTROL_PRECISE_BIT : 0);
+        }
     } else if (const auto* end = std::get_if<EndQuery>(&command)) {
         if (end->type == d3d12_query::timestamp) {
             vk.reset_query_pool(cb, heap.pool, end->index, 1);
             vk.write_timestamp(cb, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, heap.pool, end->index);
+        } else if (is_so_statistics(end->type)) {
+            vk.end_query_indexed(cb, heap.pool, end->index, so_stream(end->type));
         } else {
             vk.end_query(cb, heap.pool, end->index);
         }
@@ -4892,6 +4949,26 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
                 vk.bind_vertex_buffers2(command_buffer, slot, 1, &d.vertex_buffers[slot], &d.vertex_offsets[slot],
                                         &d.vertex_sizes[slot], &d.vertex_strides[slot]);
             }
+            // Stream output (D3D-302): bind the capture buffers SOSetTargets set, then capture this draw's
+            // primitives into them. Capture runs only when the bound pipeline declares StreamOutput (beginning
+            // transform feedback without one is a Vulkan VUID violation); a StreamOutput draw with no bound buffer
+            // is captured into nothing, as D3D12 does with no bound buffer.
+            const auto begin_stream_output = [&]() -> std::uint32_t {
+                if (!graphics.stream_output || !vk.bind_transform_feedback_buffers || !vk.begin_transform_feedback)
+                    return 0;
+                std::uint32_t count = 0;
+                for (std::uint32_t slot = 0; slot < so_buffer_slot_count; ++slot)
+                    if (d.stream_output[slot]) count = slot + 1;
+                if (!count) return 0;
+                vk.bind_transform_feedback_buffers(command_buffer, 0, count, d.stream_output.data(),
+                                                    d.stream_output_offsets.data(), d.stream_output_sizes.data());
+                vk.begin_transform_feedback(command_buffer, 0, count, nullptr, nullptr);
+                return count;
+            };
+            const auto end_stream_output = [&](std::uint32_t count) {
+                if (count) vk.end_transform_feedback(command_buffer, 0, count, nullptr, nullptr);
+            };
+            const std::uint32_t stream_output_count = begin_stream_output();
             if (draw->mesh) {
                 vk.draw_mesh_tasks(command_buffer, draw->count, draw->instances, draw->first);
                 if (vk.mesh_draw_count) ++*vk.mesh_draw_count;
@@ -4929,6 +5006,7 @@ inline void emit_commands(const PreparedList& prepared, VkCommandBuffer command_
             } else {
                 vk.draw(command_buffer, draw->count, draw->instances, draw->first, draw->first_instance);
             }
+            end_stream_output(stream_output_count);
             vk.end_rendering(command_buffer);
         }
     }

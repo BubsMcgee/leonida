@@ -406,6 +406,20 @@ struct IndexBufferView {
     std::uint32_t format;  // DXGI_FORMAT_R16_UINT (57) or DXGI_FORMAT_R32_UINT (42)
 };
 
+// D3D12_SO_BUFFER_SLOT_COUNT: the number of stream-output buffers (D3D12.h is not included in the portable subset,
+// so the value is spelled here).
+inline constexpr std::uint32_t so_buffer_slot_count = 4;
+
+// D3D12_STREAM_OUTPUT_BUFFER_VIEW: the capture buffer's VA, its size, and the VA of the 32-bit count the driver
+// writes (BufferFilledSizeLocation). Each slot is a stream-output buffer; a draw captures the streams the bound
+// pipeline declares (D3D-302).
+struct StreamOutputBufferView {
+    std::uint64_t buffer_va = 0;
+    std::uint64_t size = 0;
+    std::uint64_t filled_size_va = 0;
+    bool valid() const { return buffer_va != 0; }
+};
+
 // The views a draw captured, at the D3D12 maxima. Kept by value because the CPU descriptor slots and the bound
 // views can change after the draw is recorded, and out of line because the command variant is sized by its largest
 // member: inline they made every recorded command, barriers included, 976 bytes.
@@ -450,6 +464,9 @@ struct Draw {
     std::int32_t base_vertex = 0;
     std::uint32_t first_instance = 0;
     bool mesh = false;
+    // The stream-output targets SOSetTargets bound at the draw (D3D12_SO_BUFFER_SLOT_COUNT of them), captured with the
+    // other state so a later SOSetTargets cannot change a recorded draw. Empty when no stream output was bound.
+    std::array<StreamOutputBufferView, so_buffer_slot_count> stream_output{};
     std::shared_ptr<const DrawViewports> viewports;  // non-null when >1 viewport or >1 scissor was bound
 };
 
