@@ -615,7 +615,12 @@ inline constexpr VkSamplerReductionMode vulkan_reduction_mode(FilterMode mode) {
 // in [0, 0.25] (the Vulkan specification's note on samplers without mipmapping). An unnormalised sampler gets
 // what Vulkan requires of one: no mips, no anisotropy, no comparison.
 // A decoded GFX10 bias has absolute value at most 32. When creating a device sampler, pass its smaller limit.
-inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f) {
+// `min_lod_floor` and `lod_bias_offset` are the layer's own (LEONIDA_TEXTURE_MIN_LOD / LEONIDA_TEXTURE_LOD_BIAS): a
+// positive floor ignores the base mips and a positive offset samples coarser ones, trading texture detail and bandwidth
+// for speed. The texture's memory is unchanged. Both are ignored for a sampler without mipmapping or unnormalised
+// coordinates, where Vulkan fixes the LOD.
+inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_bias = 32.0f,
+                                          float min_lod_floor = 0.0f, float lod_bias_offset = 0.0f) {
     static_assert(int(CompareFunction::never) == int(VK_COMPARE_OP_NEVER) &&
                   int(CompareFunction::less) == int(VK_COMPARE_OP_LESS) &&
                   int(CompareFunction::equal) == int(VK_COMPARE_OP_EQUAL) &&
@@ -635,7 +640,7 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     info.addressModeU = vulkan_address_mode(sampler.address_u);
     info.addressModeV = vulkan_address_mode(sampler.address_v);
     info.addressModeW = vulkan_address_mode(sampler.address_w);
-    info.mipLodBias = std::clamp(sampler.lod_bias, -max_lod_bias, max_lod_bias);
+    info.mipLodBias = std::clamp(sampler.lod_bias + lod_bias_offset, -max_lod_bias, max_lod_bias);
     info.anisotropyEnable = sampler.max_anisotropy > 1 ? VK_TRUE : VK_FALSE;
     info.maxAnisotropy = float(std::max(sampler.max_anisotropy, 1u));
     info.compareEnable = (sampler.compare_never || sampler.compare != CompareFunction::never) ? VK_TRUE : VK_FALSE;
@@ -645,6 +650,9 @@ inline VkSamplerCreateInfo vulkan_sampler(const Sampler& sampler, float max_lod_
     if (sampler.mip_filter == MipFilter::none) {
         info.minLod = 0.0f;
         info.maxLod = 0.25f;
+    } else if (!sampler.unnormalized && min_lod_floor > info.minLod) {
+        info.minLod = std::min(min_lod_floor, 15.0f);
+        if (info.maxLod < info.minLod) info.maxLod = info.minLod;
     }
     // An integer image sampled with a FLOAT border colour reads it as 0 on NVIDIA (Vonsek, #538), so the type follows
     // integer_border. A table colour falls back to transparent black matching integer_border.

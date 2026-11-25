@@ -2030,6 +2030,10 @@ struct DeviceState {
     UINT no_output_sample_counts = 0;
     std::uint32_t f16_half_top_location = 29;
     float max_sampler_lod_bias = 0;
+    // LEONIDA_TEXTURE_MIN_LOD / LEONIDA_TEXTURE_LOD_BIAS: the layer's own sampler LOD floor and bias. They trade
+    // texture detail and bandwidth for speed; the texture's memory is unchanged.
+    float texture_min_lod = 0;
+    float texture_lod_bias = 0;
     D3D12_CONSERVATIVE_RASTERIZATION_TIER conservative_raster_tier = D3D12_CONSERVATIVE_RASTERIZATION_TIER_NOT_SUPPORTED;
     bool conservative_post_depth_coverage = false;
     // VkPhysicalDeviceDepthStencilResolveProperties: the modes a depth or stencil ResolveSubresourceRegion can use.
@@ -4838,7 +4842,8 @@ struct DeviceState {
         const leonida::DescriptorKey key = leonida::make_ssharp_key(words.data());
         if (sampler_entries.count(key)) return true;
         const g::Sampler sampler = g::decode(words);
-        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias);
+        VkSamplerCreateInfo sampler_info = g::vulkan_sampler(sampler, max_sampler_lod_bias, texture_min_lod,
+                                                             texture_lod_bias);
         // What vulkan_sampler leaves to its caller, and features this device may not have enabled.
         if (sampler_info.anisotropyEnable && !info.sampler_anisotropy) {
             log_once("anisotropic sampler without samplerAnisotropy; anisotropy", int(sampler.max_anisotropy));
@@ -11241,6 +11246,17 @@ public:
         VkPhysicalDeviceProperties properties{};
         device_properties(info.physical, &properties);
         state_.max_sampler_lod_bias = properties.limits.maxSamplerLodBias;
+        {
+            char text[32] = {};
+            size_t length = 0;
+            if (getenv_s(&length, text, "LEONIDA_TEXTURE_MIN_LOD") == 0 && length > 1)
+                state_.texture_min_lod = std::clamp(float(std::atof(text)), 0.0f, 15.0f);
+            if (getenv_s(&length, text, "LEONIDA_TEXTURE_LOD_BIAS") == 0 && length > 1)
+                state_.texture_lod_bias = std::clamp(float(std::atof(text)), -32.0f, 32.0f);
+            if (state_.texture_min_lod > 0 || state_.texture_lod_bias != 0)
+                std::fprintf(stderr, "[rt] d3d12: sampler LOD floor %.2f bias %+.2f (texture detail reduced)\n",
+                             state_.texture_min_lod, state_.texture_lod_bias);
+        }
         std::uint32_t family_count = 0;
         queue_families(info.physical, &family_count, nullptr);
         std::vector<VkQueueFamilyProperties> families(family_count);
@@ -13952,6 +13968,21 @@ public:
         const HRESULT hr = stream.has_cs ? pipeline->create_compute(stream.compute)
                                          : pipeline->create_graphics(stream.graphics, &stream.ms, &stream.as,
                                                                      stream.back_masks ? &stream.back_stencil : nullptr);
+        if (FAILED(hr) && stream.ms.pShaderBytecode) {
+            // LOCAL DIAGNOSTIC: a mesh stream create_graphics refuses, with the fields its checks read (RT 15 of
+            // 1.0.2.1's runs). One line per failure.
+            const auto& g = stream.graphics;
+            std::fprintf(stderr,
+                         "[rt] d3d12: mesh PSO refused 0x%08lx: RTs %u RT0 %d RT1 %d DSV %d samples %u/%u topo %u "
+                         "flags %#x node %u AS %d VS %d HS %d DS %d GS %d PS %d SO %u\n",
+                         static_cast<unsigned long>(hr), g.NumRenderTargets, int(g.RTVFormats[0]),
+                         int(g.RTVFormats[1]), int(g.DSVFormat), g.SampleDesc.Count, g.SampleDesc.Quality,
+                         int(g.PrimitiveTopologyType), unsigned(g.Flags), unsigned(g.NodeMask),
+                         stream.as.pShaderBytecode != nullptr, g.VS.pShaderBytecode != nullptr,
+                         g.HS.pShaderBytecode != nullptr, g.DS.pShaderBytecode != nullptr,
+                         g.GS.pShaderBytecode != nullptr, g.PS.pShaderBytecode != nullptr,
+                         g.StreamOutput.NumEntries);
+        }
         if (FAILED(hr)) {
             pipeline->Release();
             return finish(hr);

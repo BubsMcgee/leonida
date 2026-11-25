@@ -418,6 +418,26 @@ int main() {
     CHECK(vulkan_reduction_mode(FilterMode::minimum) == VK_SAMPLER_REDUCTION_MODE_MIN);
     CHECK(vulkan_reduction_mode(FilterMode::maximum) == VK_SAMPLER_REDUCTION_MODE_MAX);
 
+    // The layer's own LOD floor and bias (LEONIDA_TEXTURE_MIN_LOD / LEONIDA_TEXTURE_LOD_BIAS): a positive floor
+    // ignores the base mips, a positive offset samples coarser ones, and neither applies where Vulkan fixes the LOD.
+    {
+        Sampler s{};
+        s.mip_filter = MipFilter::linear;
+        s.max_lod = 15.0f;
+        s.lod_bias = 1.0f;
+        const VkSamplerCreateInfo plain_sampler = vulkan_sampler(s);
+        const VkSamplerCreateInfo tuned = vulkan_sampler(s, 16.0f, 1.0f, 0.5f);
+        CHECK(tuned.minLod == 1.0f && tuned.maxLod == 15.0f);
+        CHECK(tuned.mipLodBias == plain_sampler.mipLodBias + 0.5f);
+        CHECK(vulkan_sampler(s, 16.0f, 0.0f, 40.0f).mipLodBias == 16.0f);
+        s.mip_filter = MipFilter::none;
+        CHECK(vulkan_sampler(s, 16.0f, 1.0f, 0.5f).minLod == 0.0f);
+        s.mip_filter = MipFilter::linear;
+        s.unnormalized = true;
+        const VkSamplerCreateInfo unnormalised = vulkan_sampler(s, 16.0f, 1.0f, 0.5f);
+        CHECK(unnormalised.minLod == 0.0f && unnormalised.mipLodBias == 0.0f);
+    }
+
     // ---- V# ----
     CHECK((encode(Buffer{}) == BufferWords{0, 0, 0, 0xFAC}));
     Buffer buffer{.address = 0xABCD12345678, .stride = 0x3FFF, .num_records = 0xDEADBEEF, .format = 0x7F,
