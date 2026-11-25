@@ -768,7 +768,7 @@ int check_host_device_floor() {
         if (old) release(old);
 
         ID3D12Device* real = nullptr;
-        EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == S_OK && real);
+        EXPECT(xs::create_host_device(&fake_create_device, nullptr, D3D_FEATURE_LEVEL_11_0, &real) == S_OK && real);
         EXPECT(g_host_minimum == D3D_FEATURE_LEVEL_11_0);
         EXPECT(xs::max_feature_level(real) == top);   // the device keeps its highest level
         // The title asks the device it gets (the Xbox-ABI proxy) through slot 13, CheckFeatureSupport.
@@ -781,16 +781,51 @@ int check_host_device_floor() {
     }
     g_host_max = D3D_FEATURE_LEVEL_12_1;
     ID3D12Device* real = reinterpret_cast<ID3D12Device*>(&g_host_max);   // must be cleared on every failure
-    EXPECT(xs::create_host_device(nullptr, nullptr, &real) == E_NOTIMPL && !real);
-    EXPECT(xs::create_host_device(&fake_create_device, nullptr, nullptr) == E_POINTER);
+    EXPECT(xs::create_host_device(nullptr, nullptr, D3D_FEATURE_LEVEL_11_0, &real) == E_NOTIMPL && !real);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, D3D_FEATURE_LEVEL_11_0, nullptr) == E_POINTER);
     g_host_mode = HostMode::fail;
     real = reinterpret_cast<ID3D12Device*>(&g_host_max);
-    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == DXGI_ERROR_UNSUPPORTED && !real);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, D3D_FEATURE_LEVEL_11_0, &real) == DXGI_ERROR_UNSUPPORTED && !real);
     g_host_mode = HostMode::no_object;
     real = reinterpret_cast<ID3D12Device*>(&g_host_max);
-    EXPECT(xs::create_host_device(&fake_create_device, nullptr, &real) == E_FAIL && !real);
+    EXPECT(xs::create_host_device(&fake_create_device, nullptr, D3D_FEATURE_LEVEL_11_0, &real) == E_FAIL && !real);
     g_host_mode = HostMode::normal;
     EXPECT(xs::max_feature_level(nullptr) == D3D_FEATURE_LEVEL(0));
+    g_label = "xs_proxy_mock";
+    return 0;
+}
+
+// ---- 0b. The host device's requested minimum feature level (BL-2) ----
+
+// create_host_device now accepts a D3D_FEATURE_LEVEL minimum and passes it through to the PC
+// D3D12CreateDevice. Requesting a minimum above what the host supports fails with E_INVALIDARG;
+// requesting at or below it succeeds, and the created device keeps its own highest level.
+
+int check_host_device_minimum() {
+    g_label = "xs_proxy_mock host feature level minimum";
+    const D3D_FEATURE_LEVEL requested[] = {
+        D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_11_1,
+        D3D_FEATURE_LEVEL_12_0, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_2
+    };
+    for (const D3D_FEATURE_LEVEL min_level : requested) {
+        // Minimum above host max (11_0) -> E_INVALIDARG from the fake create, propagated up.
+        g_host_max = D3D_FEATURE_LEVEL_11_0;
+        g_host_mode = HostMode::normal;
+        if (min_level > D3D_FEATURE_LEVEL_11_0) {
+            ID3D12Device* real = reinterpret_cast<ID3D12Device*>(&g_host_max);
+            EXPECT(xs::create_host_device(&fake_create_device, nullptr, min_level, &real) == E_INVALIDARG && !real);
+        }
+
+        // Minimum at or below host max (12_1) -> S_OK, device created, g_host_minimum reflects the request.
+        g_host_max = D3D_FEATURE_LEVEL_12_1;
+        g_host_mode = HostMode::normal;
+        ID3D12Device* real = nullptr;
+        EXPECT(xs::create_host_device(&fake_create_device, nullptr, min_level, &real) == S_OK && real);
+        EXPECT(g_host_minimum == min_level);
+        EXPECT(xs::max_feature_level(real) == D3D_FEATURE_LEVEL_12_1);
+        release(real);
+    }
+    g_host_max = D3D_FEATURE_LEVEL_12_1;
     g_label = "xs_proxy_mock";
     return 0;
 }
@@ -4083,7 +4118,7 @@ int main(int argc, char** argv) {
         return run_fault_mode(argv[1]);
     }
     if (argc != 1) return 2;
-    if (check_tail(true) || check_host_device_floor() || check_levels() || check_slot48() || check_fence1() ||
+    if (check_tail(true) || check_host_device_floor() || check_host_device_minimum() || check_levels() || check_slot48() || check_fence1() ||
         check_fence_completed_value() || check_create_failures() || check_open_shared() ||
         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_lists() ||
         check_signalx_detection() || check_list_tail_names() || check_console_command_list() ||

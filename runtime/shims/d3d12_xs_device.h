@@ -146,13 +146,15 @@ HRESULT create_device_proxy(ID3D12Device* real, REFIID riid, void** out, bool co
 // True when `device` points at a proxy created by create_device_proxy. Used by the tests.
 bool is_device_proxy(const void* device);
 
-// The host path of D3D12XboxCreateDevice (BL-2, docs/d3d12_xs_surface.md): the PC D3D12CreateDevice (`create`)
-// asked for kHostDeviceFloor, the lowest feature level D3D12 creates a device at. It is a minimum, so asking for it
-// refuses no adapter the title can run on and still gives the device its highest level, which FEATURE_LEVELS then
-// reports. A null `create`, or S_OK with no device, is E_NOTIMPL / E_FAIL; `*out` is null on failure.
+// The host path of D3D12XboxCreateDevice (BL-2, docs/d3d12_xs_surface.md): `create_host_device` asks the PC
+// D3D12CreateDevice for `minimum`, the feature level the title requested. The 24-word `params` block carries no
+// feature level that Leonida reads, so `D3D12XboxCreateDevice` passes kHostDeviceFloor (11_0) when the title's
+// request is unknown. `minimum` is a floor, so asking for it refuses no adapter the title can run on and still
+// gives the device its highest level, which FEATURE_LEVELS then reports. A null `create`, or S_OK with no device,
+// is E_NOTIMPL / E_FAIL; `*out` is null on failure.
 constexpr D3D_FEATURE_LEVEL kHostDeviceFloor = D3D_FEATURE_LEVEL_11_0;
 using HostCreateDeviceFn = HRESULT(WINAPI*)(IUnknown* adapter, D3D_FEATURE_LEVEL minimum, REFIID riid, void** out);
-HRESULT create_host_device(HostCreateDeviceFn create, IUnknown* adapter, ID3D12Device** out);
+HRESULT create_host_device(HostCreateDeviceFn create, IUnknown* adapter, D3D_FEATURE_LEVEL minimum, ID3D12Device** out);
 
 // The highest of 11_0, 11_1, 12_0, 12_1 and 12_2 `device` reports through D3D12_FEATURE_FEATURE_LEVELS, or 0 when
 // the query fails.
