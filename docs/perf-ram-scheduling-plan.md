@@ -112,3 +112,7 @@ Get-Process gta6rt | Select-Object WorkingSet64,PrivateMemorySize64,PagedMemoryS
 
 Acceptance: world still renders; no new `GPU address arena full` / device loss; Working Set lower than the
 baseline for the same scene; `tests/test_scene_timing.py`, `pipeline_workers_test`, `fps_cap_test` still pass.
+
+## Progress log
+
+- 2026-11-25: branch `perf/ram-scheduling` cut from `origin/main` `1fe5072af`.`n  - `e4236ff7b` splash decode shared and released after both consumers; one-shot delayed working-set trim; this plan.`n  - `ad0953a88` `LEONIDA_PIPELINE_PRIORITY` compile-worker priority.`n  - `gta6rt` builds and `pipeline_workers_test` passes. Pushed to `fork/perf/ram-scheduling`.`n- Waiting: `local/render-int` moved `27beb44ba` -> `a27b2eab0` while observing; `gta6rt` exited but commits are`  still landing, so the merge/rebase is held until that branch is quiet.
