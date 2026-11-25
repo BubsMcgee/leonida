@@ -1171,11 +1171,15 @@ int main(int argc, char** argv) {
         robust_index_view = leonida::can_enable_robust_index_view(
             pd, vkGetPhysicalDeviceProperties2, sized_indirect,
             query.features.robustBufferAccess && robustness2.robustBufferAccess2,
-            // The runtime passes its bindless choice (storage-buffer update-after-bind); this device enables every
-            // supported update-after-bind feature, so any buffer one asks for the property (VUID-...-robustBufferAccess-10247).
-            q12.descriptorBindingUniformBufferUpdateAfterBind || q12.descriptorBindingStorageBufferUpdateAfterBind ||
-                q12.descriptorBindingUniformTexelBufferUpdateAfterBind ||
-                q12.descriptorBindingStorageTexelBufferUpdateAfterBind);
+            // Same predicate as the runtime's VulkanDeviceInfo::bindless (create_vulkan_device_standalone). The OR of
+            // update-after-bind flags is not equivalent: it can be true where the runtime's AND is false (a device
+            // with some update-after-bind feature but not the sampled/storage-image ones), which flips
+            // robust_index_view and therefore robustBufferAccess, and breaks the cache key again.
+            q12.runtimeDescriptorArray && query.features.shaderSampledImageArrayDynamicIndexing &&
+                query.features.shaderStorageImageArrayDynamicIndexing &&
+                q12.descriptorBindingSampledImageUpdateAfterBind &&
+                q12.descriptorBindingStorageImageUpdateAfterBind &&
+                q12.descriptorBindingStorageBufferUpdateAfterBind);
         maintenance5.pNext = nullptr;
 #endif
         (void)sized_indirect;
