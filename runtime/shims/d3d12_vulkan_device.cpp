@@ -6814,10 +6814,19 @@ HRESULT stream_unsupported(const char* reason, int type = 0) {
     return E_NOTIMPL;
 }
 
+// A stream this layer refuses with E_INVALIDARG, with the reason: without one the refusal is silent, so the
+// pipelines it skips are not visible in the log.
+HRESULT stream_invalid(const char* reason, int type = 0) {
+    d3d12_trace::stream_refusal = reason;
+    log_once(reason, type);
+    return E_INVALIDARG;
+}
+
 // The console numbering lacks the gap at 23 in the PC enumeration.
 HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out,
                               bool console_enum = false) {
-    if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
+    if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes)
+        return stream_invalid("the pipeline state stream has no subobjects");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
     for (auto& target : g.BlendState.RenderTarget) {
         target.SrcBlend = target.SrcBlendAlpha = D3D12_BLEND_ONE;
@@ -6846,7 +6855,8 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     std::size_t at = 0;
     while (at < size) {
         D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type;
-        if (size - at < sizeof(type)) return E_INVALIDARG;
+        if (size - at < sizeof(type))
+            return stream_invalid("the pipeline state stream ends inside a subobject type");
         std::memcpy(&type, base + at, sizeof(type));
         type = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(d3d12_xs::pc_stream_type(unsigned(type), console_enum));
         // The versioned depth-stencil and rasterizer subobjects describe the same state as their base type, so the
@@ -6858,7 +6868,9 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
         else if (type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER1 ||
                  type == D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER2)
             family = D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER;
-        if (unsigned(type) >= 64 || (seen >> unsigned(family) & 1)) return E_INVALIDARG;
+        if (unsigned(type) >= 64) return stream_invalid("unknown pipeline state stream subobject type", int(type));
+        if (seen >> unsigned(family) & 1)
+            return stream_invalid("two subobjects of one family in the pipeline state stream", int(type));
         seen |= std::uint64_t(1) << unsigned(family);
         bool ok = true;
         const auto take = [&](auto& value) {
@@ -6982,13 +6994,13 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
             break;
         }
         default:
-            log_once("unknown pipeline state stream subobject type:", int(type));
-            return E_INVALIDARG;
+            return stream_invalid("unknown pipeline state stream subobject type", int(type));
         }
-        if (!ok) return E_INVALIDARG;
+        if (!ok) return stream_invalid("the pipeline state stream ends inside a subobject payload");
     }
-    if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
-    if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
+    if (out.has_cs && out.has_graphics_stage) return stream_invalid("a compute stage with graphics stages");
+    if (!out.has_cs && !out.has_graphics_stage)
+        return stream_invalid("no shader stage in the pipeline state stream");
     return S_OK;
 }
 
@@ -7168,10 +7180,12 @@ public:
             return stream_unsupported("amplification shaders are not supported; stream subobject",
                                       D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS);
         }
+        // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
         if (mesh && (desc.VS.BytecodeLength || desc.HS.BytecodeLength || desc.DS.BytecodeLength ||
                      desc.GS.BytecodeLength || desc.StreamOutput.NumEntries))
-            return E_INVALIDARG;  // D3D12: a mesh PSO has no vertex, tessellation or geometry stage
-        if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength)) return E_INVALIDARG;
+            return stream_invalid("a mesh pipeline with a vertex, tessellation or geometry stage");
+        if (!mesh && (!desc.VS.pShaderBytecode || !desc.VS.BytecodeLength))
+            return stream_invalid("a graphics pipeline with no vertex stage");
         if (mesh && (!device_.info.mesh_shader || !vk.vkCmdDrawMeshTasksEXT)) {
             return stream_unsupported("mesh-shader PSOs need VK_EXT_mesh_shader, which the device has not enabled; stage", 1);
         }
@@ -12125,14 +12139,20 @@ public:
         d3d12_trace::stream_refusal = nullptr;
         d3d12_xs::used_console_stream = false;
         const auto finish = [&](HRESULT hr) {
-            if (hr == E_NOTIMPL)
-                d3d12_trace::record("PipelineStream::Refused", d3d12_trace::stream_refusal ?
-                                    d3d12_trace::stream_refusal : "other backend state");
+            if (hr == E_NOTIMPL || hr == E_INVALIDARG) {
+                const char* reason = d3d12_trace::stream_refusal;
+                if (!reason && hr == E_INVALIDARG) {
+                    // A refusal from the graphics state itself (create_graphics) carries no reason of its own.
+                    log_once("a pipeline state stream this layer refuses", 0);
+                    reason = "a pipeline state stream this layer refuses";
+                }
+                d3d12_trace::record("PipelineStream::Refused", reason ? reason : "other backend state");
+            }
             return d3d12_trace::result(method, hr);
         };
         if (!out) return finish(E_POINTER);
         *out = nullptr;
-        if (!desc) return finish(E_INVALIDARG);
+        if (!desc) return finish(stream_invalid("no pipeline state stream description"));
         PipelineStream stream;
         HRESULT parsed = parse_pipeline_stream(*desc, stream);
         // A stream the PC reading refuses, or leaves with an AS and no MS (no valid PC stream), is read again with the
