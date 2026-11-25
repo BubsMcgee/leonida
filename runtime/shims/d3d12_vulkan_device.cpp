@@ -2127,20 +2127,28 @@ struct DeviceState {
         return enabled;
     }
 
-    // Called by the view writer when a buffer view that reaches the title's pages is made (see flush_title_write_backs).
-    void mark_title_write(std::uintptr_t va, std::size_t bytes) {
-        if (title_write_back_enabled()) title_write_back.mark(va, bytes);
+    // Called by the view writer when a buffer view that reaches the title's pages is made. Its range joins the live
+    // set copied back at the next refresh boundary (see wait_title_write_backs / flush_title_write_backs).
+    void register_title_view(std::uintptr_t va, std::size_t bytes) {
+        if (title_write_back_enabled()) title_write_back.add_view(va, bytes);
     }
 
-    // Called after the copies are refreshed for this submission. The GPU that wrote a marked range has finished, and
-    // every page the title wrote since is already in the copy (the refresh put it there), so copying a page back
-    // cannot lose a title write. Pages the title has no readable mapping for are left alone.
+    // Called before the refresh copies the title's pages into the same copies a shader writes through. The submission
+    // that may have written a live view has to finish first: otherwise the refresh would overwrite the shader's write
+    // and the copy-back would carry the stale bytes. Waits on the queues' timelines, not the device: every submission
+    // accepted so far, and nothing still being recorded.
+    void wait_title_write_backs() {
+        if (!title_write_back_enabled() || !title_write_back.has_pending() || !context) return;
+        context->wait_retire_ticket(context->submitted_retire_ticket());
+    }
+
+    // Called after the copies are refreshed for this submission. The GPU writes are finished (wait_title_write_backs)
+    // and every page the title wrote since is in the copy the refresh just made, so copying a marked range back
+    // applies the shader's writes without losing a title write. Pages the title has no readable mapping for are left.
     void flush_title_write_backs() {
-        if (!title_write_back_enabled() || title_write_back.empty()) return;
-        const std::vector<leonida::title_write_back::Range> ranges = title_write_back.take();
-        if (!context || context->is_device_lost()) return;
-        if (context->observe_result(context->vk.vkDeviceWaitIdle(info.device), "vkDeviceWaitIdle") != VK_SUCCESS)
-            return;
+        if (!title_write_back_enabled()) return;
+        const std::vector<leonida::title_write_back::Range> ranges = title_write_back.take_pending();
+        if (ranges.empty() || !context || context->is_device_lost()) return;
         std::uint64_t copied = 0;
         for (const auto& r : ranges) {
             const std::uintptr_t first = r.title_va, last = r.title_va + r.bytes;
@@ -2161,6 +2169,13 @@ struct DeviceState {
                          "KiB so far)\n",
                          static_cast<unsigned long long>(copied >> 10), static_cast<unsigned long long>(n >> 10));
         }
+    }
+
+    // Called at the end of every submission, after its descriptor tables were scanned: the views those tables bound
+    // are copied at a later boundary, once that submission has finished. A submission whose windows are not refreshed
+    // (LEONIDA_REFRESH_PER_FRAME) accumulates them for the next full boundary.
+    void boundary_title_write_backs() {
+        if (title_write_back_enabled()) title_write_back.boundary();
     }
 
     void refresh_shadows(bool heaps = true, bool pages = true) {
@@ -2856,8 +2871,19 @@ struct DeviceState {
         // Each slot's V# and the counter V# in its second half, as a console heap's GPU copy (fix_vsharp): a base in
         // the title's memory is rebased, one nothing backs becomes zero-size instead of a GPU fault at heap_base plus
         // that address.
+        // Before a V# is rebased, its words still name the title's buffer (or an arena base already known here), so a
+        // table slot that holds a title-window view is marked for the write-back of the submission it is bound for.
+        const auto mark_view = [this](const std::uint32_t* w) {
+            if (!title_write_back_enabled() || (w[3] >> 30) || !w[2]) return;
+            const std::uint64_t base = std::uint64_t(w[0]) | (std::uint64_t(w[1] & 0xffff) << 32);
+            const std::uint32_t stride = (w[1] >> 16) & 0x3fffu;
+            title_write_back.mark_vsharp(std::uintptr_t(base),
+                                         std::size_t(std::uint64_t(w[2]) * (stride ? stride : 1)));
+        };
         for (VkDeviceSize at = table_va; at + kDescriptorSize <= end; at += kDescriptorSize) {
             auto* const w = reinterpret_cast<std::uint32_t*>(arena.mapped + at);
+            mark_view(w);
+            mark_view(w + 4);
             fix_vsharp(w, VsharpPath::table);
             fix_vsharp(w + 4, VsharpPath::table);
         }
@@ -2994,6 +3020,9 @@ struct DeviceState {
         if ((to & ((1ull << 48) - 1)) == base) return VsharpResult::unchanged;
         w[0] = uint32_t(to);
         w[1] = (w[1] & 0xffff0000u) | uint32_t((to >> 32) & 0xffff);
+        // A later heap scan sees the rebased words, so remember which title-window view they stand for.
+        if (title_write_back_enabled())
+            title_write_back.note_rebase(std::uintptr_t(base), std::uintptr_t(to), std::size_t(span));
         return VsharpResult::rebased;
     }
 
@@ -10973,8 +11002,12 @@ public:
                 const std::uint64_t serial = phases::totals().present_serial.load(std::memory_order_relaxed);
                 full = refreshed_present_.exchange(serial, std::memory_order_relaxed) != serial;
             }
+            // The title windows are refreshed only when `full` (LEONIDA_REFRESH_PER_FRAME=1/2 skips the copies on the
+            // other submissions), so the write-back waits and copies there too: its ordering depends on the refresh.
+            if (full) state_.wait_title_write_backs();
             state_.refresh_shadows(full || per_frame < 2, full);
-            state_.flush_title_write_backs();
+            if (full) state_.flush_title_write_backs();
+            state_.boundary_title_write_backs();
             // LEONIDA_GEOMETRY_ASYNC=1 (for runs that only need the title to go on): the geometry copies are brought
             // up to date on a worker of ours, started here and not waited for, instead of on the title's GPU submit
             // thread (speed-27: 230-330 ms a refresh after the load, a VirtualQuery and VirtualProtect per written
@@ -14456,9 +14489,6 @@ public:
         }
         const UINT64 va = resource->GetGPUVirtualAddress();
         const UINT64 counter_va = counter ? counter->GetGPUVirtualAddress() : 0;
-        // A shader writing through this view reaches the title's pages: have the copy they live in brought back to
-        // them after the submission (title windows only; a slot-133 copy is not registered here).
-        state_.mark_title_write(std::uintptr_t(va), std::size_t(rd.Width));
         if (!va || (counter && !counter_va)) return;
         write_buffer_uav_at(va, rd.Width, desc, counter ? counter_va + desc->Buffer.CounterOffsetInBytes : 0,
                             destination);
@@ -14500,6 +14530,11 @@ public:
                      int(view.NumElements));
             return false;
         }
+        // The view's own range, not the whole resource: a shader write through it is copied back to the title's pages
+        // at the next refresh boundary. A range outside every title window is ignored by the registry.
+        state_.register_title_view(std::uintptr_t(va + UINT64(view.FirstElement) * unit),
+                                   std::size_t(UINT64(view.NumElements) * unit));
+        if (counter_va) state_.register_title_view(std::uintptr_t(counter_va), 4);
         g::Buffer buffer{};
         buffer.address = va + view.FirstElement * unit;
         buffer.stride = structured || typed ? std::uint32_t(unit) : 0;
