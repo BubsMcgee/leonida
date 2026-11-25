@@ -11452,6 +11452,7 @@ public:
         address.buffer = arena.buffer;
         arena.address = vk.vkGetBufferDeviceAddress(state_.info.device, &address);
         arena.size = info.size;
+        state_.info.arena_size = arena.size;
         // The GPU address arena is the console's address space: the title names it by offset, so the label path
         // has to find it (src/gpu_label_memory.h). Its address space starts at 0.
         if (arena.mapped)
@@ -13965,21 +13966,31 @@ public:
         ProbeApiWrite probe_note{state_, destination.ptr, 1, "CreateConstantBufferView"};  // LOCAL DIAGNOSTIC
         std::memset(reinterpret_cast<void*>(destination.ptr), 0, kDescriptorSize);
         if (!desc || !desc->BufferLocation || !desc->SizeInBytes) return;
+        // D3D12 caps a constant-buffer view at 4096 * 16 = 64 KiB, rounded up to 256 bytes (a retail world frame
+        // passes >1 MiB, which can fault the GPU or allocate an oversized title-VA window). fxceless/victory-fork#911.
+        constexpr std::uint32_t kMaxConstantBufferViewBytes = 65536u;
+        const std::uint32_t requested_bytes = desc->SizeInBytes;
+        const std::uint64_t rounded_bytes = align_up(requested_bytes, 256ull);
+        const std::uint32_t clamped_bytes =
+            static_cast<std::uint32_t>(std::min<std::uint64_t>(rounded_bytes, kMaxConstantBufferViewBytes));
+        if (requested_bytes > kMaxConstantBufferViewBytes)
+            log_once("constant buffer view size clamped to 64 KiB; requested bytes",
+                     int(std::min<UINT>(requested_bytes, UINT(INT_MAX))));
         leonida::gfx10::Buffer buffer{};
         buffer.address = desc->BufferLocation;
-        const bool indexed = vector_rows && desc->SizeInBytes % 16 == 0;
+        const bool indexed = vector_rows && clamped_bytes % 16 == 0;
         // A vector ALU fetch selects a 16-byte constant register with IDXEN. Scalar SMEM
         // still sees the very same byte extent, NUM_RECORDS * STRIDE.
         buffer.stride = indexed ? 16u : 0u;
-        buffer.num_records = indexed ? desc->SizeInBytes / 16u : desc->SizeInBytes;
+        buffer.num_records = indexed ? clamped_bytes / 16u : clamped_bytes;
         buffer.format = leonida::gfx10::format_from_vulkan(VK_FORMAT_R32_UINT);
         buffer.oob_select = indexed ? leonida::gfx10::OobSelect::structured_with_offset : leonida::gfx10::OobSelect::raw;
         static const bool console_form = [] {
             wchar_t value[2]{};
             return !(GetEnvironmentVariableW(L"LEONIDA_CBV_RAW", value, 2) == 1 && value[0] == L'1');
         }();
-        const uint64_t rows = (uint64_t(desc->SizeInBytes) + 15) / 16;
-        buffer.address = state_.vsharp_address(buffer.address, console_form ? rows * 16 : desc->SizeInBytes);
+        const uint64_t rows = (uint64_t(clamped_bytes) + 15) / 16;
+        buffer.address = state_.vsharp_address(buffer.address, console_form ? rows * 16 : clamped_bytes);
         // No backing for the title's memory: a zero-size V# (loads 0, stores dropped), never the raw address.
         const bool backed = buffer.address != 0;
         if (!backed) {

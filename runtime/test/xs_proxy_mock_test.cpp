@@ -2391,6 +2391,20 @@ int check_lists() {
     // Console-only extras (27-30) and the unmeasured tail are recorded and return 0, never forwarded.
     EXPECT(raw(list, 27, 1, 2, 3, 4) == 0 && real->calls[27] == 0);
     EXPECT(raw(list, 148, 0, 16) == 0);  // AllocateUploadMemory(0, ...) refuses
+    // Cache-flush slots 69/131/132 record one global UAV barrier each on a direct list (an undetected layout is
+    // taken as the newer one, as console_value_op does); the real list's ResourceBarrier is PC slot 26.
+    const auto cache_flush_before = real->calls[26];
+    EXPECT(raw(list, 69, 1, 2, 3, 4) == 0 && real->calls[26] == cache_flush_before + 1);
+    EXPECT(raw(list, 131, 1, 2, 3, 4) == 0 && real->calls[26] == cache_flush_before + 2);
+    EXPECT(raw(list, 132, 1, 2, 3, 4) == 0 && real->calls[26] == cache_flush_before + 3);
+    // A bundle skips the barrier: a UAV barrier is invalid there and would fail Close.
+    void* bundle = nullptr;
+    EXPECT(hr_of(raw(device, 12, 0, D3D12_COMMAND_LIST_TYPE_BUNDLE, word(allocator), 0, word(&gcl_iid),
+                     word(&bundle))) == S_OK);
+    Mock* const bundle_real = mock->last_child;
+    const auto bundle_barriers_before = bundle_real->calls[26];
+    EXPECT(raw(bundle, 69, 1, 2, 3, 4) == 0 && bundle_real->calls[26] == bundle_barriers_before);
+    EXPECT(release(bundle) == 0 && bundle_real->refs == 0);
     // AllocateUploadMemory carves from the upload arena; a later root SRV gets a real address for it.
     const std::uint64_t p1 = raw(list, 148, 4096, 64);
     const std::uint64_t p2 = raw(list, 148, 16, 16);
@@ -3926,6 +3940,11 @@ int check_list_values() {
     static_assert(xs::console_value_op(69, xs::kConsoleLayoutOlder) == xs::ConsoleValueOp::write32);
     static_assert(xs::console_value_op(72, xs::kConsoleLayoutOlder) == xs::ConsoleValueOp::wait64);
     static_assert(xs::console_value_op(73, xs::kConsoleLayoutOlder) == xs::ConsoleValueOp::none);
+    // The cache-flush slots are a newer-layout feature; slot 69 is a value write in the older layout.
+    static_assert(xs::console_cache_flush_slot(69, 0) && xs::console_cache_flush_slot(69, xs::kConsoleLayoutNewer));
+    static_assert(xs::console_cache_flush_slot(131, 0) && xs::console_cache_flush_slot(132, 0));
+    static_assert(!xs::console_cache_flush_slot(69, xs::kConsoleLayoutOlder));
+    static_assert(!xs::console_cache_flush_slot(70, 0));  // depth bounds, not a flush
     // Comparison codes: memory OP reference, D3D12_COMPARISON_FUNC order.
     EXPECT(xs::console_value_met(2, 4, 5, true) && !xs::console_value_met(2, 5, 5, true));
     EXPECT(xs::console_value_met(3, 5, 5, true) && !xs::console_value_met(3, 6, 5, true));

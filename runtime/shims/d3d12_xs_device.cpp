@@ -2758,6 +2758,9 @@ struct ListProxy {
     alignas(8) std::uint8_t console_fields[0x600];
     std::atomic<unsigned long> refs;    // past the console body
     unsigned pc_slot_count;             // slots the real list implements; mapped slots past it are refused
+    // Cache-flush slots 69/131/132 record a UAV barrier on DIRECT and COMPUTE lists only; bundle and copy lists
+    // would be invalidated by one.
+    D3D12_COMMAND_LIST_TYPE list_type = D3D12_COMMAND_LIST_TYPE_DIRECT;
     std::vector<D3D12_VERTEX_BUFFER_VIEW> vb_scratch;  // slot-48 views with their VAs translated
     std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> so_scratch;  // slot-49 views, same treatment
 
@@ -3174,6 +3177,24 @@ void note_bundle_value_op(ConsoleValueOp op) {
                      op == ConsoleValueOp::write32 || op == ConsoleValueOp::write64 ? "write" : "wait");
 }
 
+// Records a global UAV barrier (D3D12_RESOURCE_BARRIER_TYPE_UAV, pResource = nullptr) for console cache-flush
+// slots 69 (FlushPipelineX), 131 (FlushGpuCacheRangeX) and 132 (FlushShaderCacheRangeX), adapted from
+// ThatRecompDev/five-star-recomp@a0e8674 (GPL-3.0). Only DIRECT and COMPUTE lists execute UAV work and accept a UAV
+// barrier; bundle and copy lists skip it so they are never invalidated.
+void list_record_cache_flush_barrier(ListProxy* self, unsigned slot) {
+    if (!self || !self->real || self->pc_slot_count <= 26) return;  // PC slot 26 is ResourceBarrier
+    if (self->list_type != D3D12_COMMAND_LIST_TYPE_DIRECT && self->list_type != D3D12_COMMAND_LIST_TYPE_COMPUTE)
+        return;
+    D3D12_RESOURCE_BARRIER barrier{};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+    barrier.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+    barrier.UAV.pResource = nullptr;
+    self->real->ResourceBarrier(1, &barrier);
+    static std::atomic<bool> logged{false};
+    if (first_call(logged))
+        std::fprintf(stderr, "[rt] d3d12_xs: list slot %u cache flush recorded a global UAV barrier\n", slot);
+}
+
 template <unsigned Slot>
 std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t a2, std::uint64_t a3,
                                std::uint64_t a4, std::uint64_t a5, std::uint64_t a6, std::uint64_t a7,
@@ -3228,6 +3249,13 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t 
 #endif
             if constexpr (Slot == kConsoleAllocateUpload) {
                 return upload_alloc(self->device, a1, a2);  // (size, alignment); the comment at UploadChunk
+            }
+            if constexpr (Slot == 69 || Slot == 131 || Slot == 132) {
+                if (console_cache_flush_slot(Slot, layout)) {
+                    list_record_cache_flush_barrier(self, Slot);
+                    return 0;
+                }
+                if constexpr (Slot == 131 || Slot == 132) return 0;  // older layout: console-only no-ops
             }
             if constexpr (Slot >= 69 && Slot <= 74) {  // memory writes and waits, by the layout (console_value_op)
                 const ConsoleValueOp op = console_value_op(Slot, layout);
@@ -3620,6 +3648,7 @@ HRESULT wrap_list(IUnknown* created, DeviceProxy* device, const IID* riid, void*
     proxy->device = device;
     proxy->refs.store(1, std::memory_order_relaxed);
     proxy->pc_slot_count = detect_list_slot_count(created);
+    proxy->list_type = type;
     proxy->pin_cursor_at_limit();
     proxy_add_ref(device);  // the list keeps its Xbox-ABI device alive for GetDevice
 

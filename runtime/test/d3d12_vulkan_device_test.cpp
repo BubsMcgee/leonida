@@ -7108,6 +7108,9 @@ int main() {
         const rt::d3d12::VulkanDeviceInfo* made = rt::d3d12::vulkan_device_info(standalone.p);
         EXPECT(made != nullptr);
         if (made) {
+            // The actual GPU address arena size is exposed for callers (the merge glue's set_heap_base reads it).
+            EXPECT(made->arena_size == rt::d3d12::device_arena_size(standalone.p));
+            if (made->buffer_device_address) EXPECT(made->arena_size > 0);
             const auto features2 = reinterpret_cast<PFN_vkGetPhysicalDeviceFeatures2>(
                 made->get_instance_proc(made->instance, "vkGetPhysicalDeviceFeatures2"));
             EXPECT(features2 != nullptr);

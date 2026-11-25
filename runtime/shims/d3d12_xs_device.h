@@ -452,6 +452,14 @@ inline constexpr ConsoleValueOp console_value_op(unsigned slot, unsigned char co
     if (slot < first || slot > first + 3) return ConsoleValueOp::none;
     return static_cast<ConsoleValueOp>(slot - first + 1);
 }
+// Console cache-flush list slots in the newer layout (adapted from ThatRecompDev/five-star-recomp@a0e8674): slot 69
+// (FlushPipelineX), 131 (FlushGpuCacheRangeX) and 132 (FlushShaderCacheRangeX) record a global UAV barrier. Slot 69 is
+// a value write in the older layout, so only the newer/undetected layout treats it as a flush (as console_value_op
+// does with 71-74).
+inline constexpr bool console_cache_flush_slot(unsigned slot, unsigned char console_layout) {
+    if (slot != 69 && slot != 131 && slot != 132) return false;
+    return console_layout != kConsoleLayoutOlder;
+}
 // A wait's comparison codes are the D3D12_COMPARISON_FUNC values, memory OP reference: 2 less, 3 equal, 4 less or
 // equal, 5 greater, 6 not equal, 7 greater or equal (the title's, with a rising reference). 8 (always), 1 (never)
 // and any other code count as met: a wait nothing can meet would only hold the queue to its timeout. A 32-bit wait

@@ -113,6 +113,8 @@ struct VulkanDeviceInfo {
     // the physical device when the D3D12 device is created; a test sets smaller ones to simulate a device.
     VkDeviceSize max_buffer_size = 0;
     VkDeviceSize max_memory_allocation_size = 0;
+    // The GPU address arena's actual size in bytes once create_arena() made it (0 when no arena exists).
+    std::uint64_t arena_size = 0;
     // The subgroup sizes the device offers and whether subgroupSizeControl / computeFullSubgroups are enabled on it
     // (src/subgroup_size.h). Default: nothing, so pipelines request no size.
     leonida::SubgroupSizeCaps subgroup;

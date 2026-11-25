@@ -828,6 +828,43 @@ int main() {
                 EXPECT(std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(slot_idx).ptr) + 16, zeros, 16) == 0);
             }
 
+            // The D3D12 64 KiB CBV cap (fxceless/victory-fork#911): a retail world frame passes >1 MiB CBVs, which
+            // must be clamped to 4096 rows / 64 KiB (or 64 KiB bytes in raw form) so neither the GPU nor a title-VA
+            // window sees an oversized extent. Values are rounded up to a 256-byte multiple first.
+            {
+                const auto large_desc = buffer_desc(2 * 1024 * 1024, D3D12_RESOURCE_FLAG_NONE);
+                Ref<ID3D12Resource> large_cb;
+                EXPECT(SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &large_desc,
+                                                                 D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                                                 IID_PPV_ARGS(&large_cb.p))));
+                const D3D12_GPU_VIRTUAL_ADDRESS large_va = large_cb->GetGPUVirtualAddress();
+                EXPECT(large_va >= 0x10000 && large_va < (1ull << 32));
+                struct ClampCase { UINT requested; std::uint32_t clamped; };
+                const ClampCase cases[] = {
+                    {64u, 256u},         // rounded up to the 256-byte minimum
+                    {65536u, 65536u},    // exact 64 KiB cap
+                    {1306368u, 65536u},  // retail world-frame >1 MiB CBV clamped to 64 KiB
+                    {UINT_MAX, 65536u},  // extreme size must clamp without 32-bit overflow
+                };
+                for (UINT i = 0; i < 4; ++i) {
+                    const D3D12_CONSTANT_BUFFER_VIEW_DESC desc{large_va, cases[i].requested};
+                    device->CreateConstantBufferView(&desc, slot_cpu(4 + i));
+                    leonida::gfx10::BufferWords raw{};
+                    std::memcpy(raw.data(), reinterpret_cast<const void*>(slot_cpu(4 + i).ptr), sizeof(raw));
+                    leonida::gfx10::Buffer decoded{};
+                    EXPECT(leonida::gfx10::decode(raw, decoded));
+                    EXPECT(decoded.address == large_va);
+                    if (raw_cbv) {
+                        EXPECT(decoded.stride == 0 && decoded.num_records == cases[i].clamped);
+                    } else {
+                        EXPECT(decoded.stride == 16 && decoded.num_records == cases[i].clamped / 16u);
+                        EXPECT(raw[3] == 0x0002403Cu);
+                    }
+                    EXPECT(std::memcmp(reinterpret_cast<const std::uint8_t*>(slot_cpu(4 + i).ptr) + 16, zeros, 16) == 0);
+                }
+                std::printf("CreateConstantBufferView clamps oversize CBVs to 64 KiB (raw bytes or 4096 rows)\n");
+            }
+
             // Copy CBV data into the arena buffer, then run 4 dispatches:
             //   1) CBV A at byte offset 0 (all 64 dwords in-bounds)
             //   2) CBV A at byte offset 128 (dwords 0..31 in-bounds, dwords 32..63 OOB -> 0)

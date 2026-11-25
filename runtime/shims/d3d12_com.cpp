@@ -2236,6 +2236,14 @@ public:
     void STDMETHODCALLTYPE ExecuteCommandLists(UINT count, ID3D12CommandList* const* lists) override {
         constexpr auto method = "ID3D12CommandQueue::ExecuteCommandLists";
         std::lock_guard lock(mutex_);
+        // A lost device has no valid queue: replaying would only queue work the driver drops, and the title's
+        // own error paths are what report the removal. Skip the batch (the result is unsupported, as for a bad list).
+        if (context_.is_device_lost()) {
+            note_once("ExecuteCommandLists skipped: device lost");
+            last_result_ = leonida::ReplayResult::unsupported;
+            d3d12_trace::record(method, "skipped");
+            return;
+        }
         if (count > 0 && !lists) {
             note_once("ExecuteCommandLists: null command list array with non-zero count");
             last_result_ = leonida::ReplayResult::unsupported;
