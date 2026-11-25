@@ -94,7 +94,24 @@ default when the title gives no size). Lazy per-page commit is possible but need
   prerender frame while streaming.
 - Measure with `PipelineWorkers::Stats` (`d3d12::pipeline_worker_stats`) and `LEONIDA_MEM_PROBE`.
 
-## 4. Merge / rebase / rebuild (only after the other instance stops)
+## 3b. Sparse/multi-buffer arena (measured 2026-11-25)
+
+- The device reports `maxBufferSize = 1 TiB`, `maxMemoryAllocationSize ~= 2^64`, `sparseBinding`,
+  `sparseResidencyBuffer` and `bufferDeviceAddress` all true, so a sparse buffer larger than 4 GiB is legal.
+- Attempted `LEONIDA_ARENA_SPARSE=1 LEONIDA_ARENA_MB=9216`: `vkCreateBuffer` succeeds, but the sparse buffer's
+  `memoryTypeBits` is `0x2` only (device-local type 1). This driver does not offer a host-visible sparse buffer, so
+  the host-writable arena cannot be sparse. The runtime logs the reason and falls back to the 4080 MiB
+  single-buffer arena.
+- Viable pivot: a **multi-buffer** arena. Keep the 4080 MiB host-visible low buffer for descriptor heaps, shader
+  code and CPU-written buffers, and add a second **device-local** high buffer (plain or sparse) for GPU-only
+  buffers. A high buffer's console VA is `high_bda - low_bda + (offset - high_start)`: root arguments (64-bit) are
+  exact, and a V# works only while that bias is a positive 48-bit value (high BDA above the low arena). Resource
+  bindings must name the high `VkBuffer`; a sparse high buffer works because it never needs a host mapping.
+- Next: create the high device-local buffer (try 4 GiB on the 12 GB card), log the BDA delta, classify
+  `arena_allocate` by host-writability, add `arena.device_address`/`buffer_for`, and wire the Buffer binding and V#
+  paths. Descriptor heaps and shader code stay low (32-bit table pointers).
+
+
 
 1. Confirm `gta6rt` has exited and `local/render-int` has been still for ~10 min (and no new worktree/branch).
 2. `git fetch origin --prune`; record `origin/main` and `local/render-int` heads.

@@ -84,6 +84,30 @@ inline ArenaSize decide_arena_size(const char* env, const ArenaLimits& limits, V
     return size;
 }
 
+// A sparse arena's request (LEONIDA_ARENA_SPARSE, or LEONIDA_ARENA_MB over the 4095 MiB floor): one VkBuffer whose
+// device address is heap_base, backed by chunk-sized VkDeviceMemory allocations. The buffer may exceed one
+// VkDeviceMemory's size (a single host-visible BAR allocation capped at ~4080 MiB on an RTX 3080 Ti), because
+// vkQueueBindSparse binds each chunk separately. Only maxBufferSize caps it here; maxMemoryAllocationSize applies to
+// one VkDeviceMemory, not to the sparse buffer.
+constexpr VkDeviceSize kArenaSparseMaxMiB = 16384;
+
+inline ArenaSize decide_sparse_arena_size(const char* env, const ArenaLimits& limits) {
+    VkDeviceSize megabytes = kArenaDefaultMiB;
+    if (env && *env)
+        megabytes = VkDeviceSize(std::clamp<long long>(std::strtoll(env, nullptr, 10), (long long)kArenaMinMiB,
+                                                       (long long)kArenaSparseMaxMiB));
+    ArenaSize size;
+    size.requested = size.bytes = megabytes * kArenaMiB;
+    if (limits.max_buffer_size) {
+        const VkDeviceSize capped = limits.max_buffer_size / kArenaMiB * kArenaMiB;
+        if (capped < size.bytes) {
+            size.bytes = capped;
+            size.capped |= arena_cap_buffer;
+        }
+    }
+    return size;
+}
+
 // The Vulkan names of the limits in `capped`, for the log line.
 inline const char* arena_cap_name(unsigned capped) {
     if (capped & arena_cap_bar) return "Resizable BAR memory types for a buffer that large";
