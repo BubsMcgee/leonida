@@ -447,9 +447,13 @@ The runtime seeds its `VkPipelineCache` from the cache this tool saves, so a pip
 driver gives it the same cache key in both programs. Measured on Windows with an RX 9070 XT (driver
 32.0.32029.2010) and one synthetic compute shader, reading the application-cache-hit bit:
 
-- `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` are each part of the key. The first two are
+- `robustBufferAccess`, `scalarBlockLayout` and `robustImageAccess` are each part of the key. `scalarBlockLayout` is
   disabled on both devices; the runtime's device enables supported core image robustness for storage views, and so
-  does the checker. Nothing else that differs between the two devices changed the key on RX 9070 XT: the checker's
+  does the checker. Since `ba626820e` (#1723) the runtime's device enables `robustBufferAccess`, with `VK_EXT_robustness2`'s
+  `robustBufferAccess2`, for bounded indexed indirect draws (`leonida::can_enable_robust_index_view`), and
+  `nullDescriptor` wherever it is offered. The checker makes the same choice with the same helper. On an RX 7900 XT
+  (driver 32.0.32029.2010) a checker that left `robustBufferAccess` off missed the runtime's cache, and matching
+  `nullDescriptor` alone was not enough. Nothing else that differs between the two devices changed the key on RX 9070 XT: the checker's
   other features, the runtime's extensions, the application name.
 - On Windows 11 with an Intel RaptorLake-S iGPU, clearing those three features alone makes the checker's cache hit
   on the runtime's device. On an NVIDIA GeForce RTX 5060 Laptop GPU (driver 621.24), NVIDIA also hashes
