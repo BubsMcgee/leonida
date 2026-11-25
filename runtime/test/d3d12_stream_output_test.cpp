@@ -199,6 +199,7 @@ int main() {
     const D3D12_RANGE no_write{0, 0};
     so_readback->Unmap(0, &no_write);
     EXPECT(mismatches == 0);
+    EXPECT(vk.validation_errors() == 0);
 
     std::printf("stream_output: 3 vertices captured through SOSetTargets + a StreamOutput PSO, %d mismatches\n",
                mismatches);
