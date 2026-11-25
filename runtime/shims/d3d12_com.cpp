@@ -434,6 +434,22 @@ public:
         set_vertex_buffers(start, count, views);
     }
 
+    // D3D-302. Unlike vertex buffers, an unbound slot inside [start, start+count) stays unbound (no zero-page
+    // fallback): the pipeline's StreamOutput declaration says how many slots it needs, and prepare_draw treats any
+    // of those left unbound as "stream output not active for this draw" rather than inventing a destination.
+    void STDMETHODCALLTYPE SOSetTargets(UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) override {
+        if (std::uint64_t(start) + count > so_buffers_.size()) return check(false);
+        if (type_ == D3D12_COMMAND_LIST_TYPE_BUNDLE) {
+            std::vector<D3D12_STREAM_OUTPUT_BUFFER_VIEW> copy;
+            if (views) copy.assign(views, views + count);
+            defer([=, copy = std::move(copy), bound = views != nullptr](GraphicsCommandList& l) {
+                l.set_so_targets(start, count, bound ? copy.data() : nullptr);
+            });
+            return;
+        }
+        set_so_targets(start, count, views);
+    }
+
     void STDMETHODCALLTYPE IASetIndexBuffer(const D3D12_INDEX_BUFFER_VIEW* view) override {
         if (list_.closed()) return;
         const std::optional<D3D12_INDEX_BUFFER_VIEW> copy = view ? std::optional(*view) : std::nullopt;
@@ -1563,6 +1579,7 @@ private:
     D3D12_GPU_VIRTUAL_ADDRESS sampler_base_ = 0;
     std::uint32_t topology_ = 0;  // D3D_PRIMITIVE_TOPOLOGY_UNDEFINED
     std::array<leonida::VertexBufferView, D3D12_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertex_buffers_{};
+    std::array<leonida::SOBufferView, D3D12_SO_BUFFER_SLOT_COUNT> so_buffers_{};
     leonida::IndexBufferView index_{};
     // SetGraphicsRootDescriptorTable / SetComputeRootDescriptorTable: VA, CBV/SRV/UAV slots the signature declares
     std::vector<std::pair<std::uint64_t, std::uint32_t>> tables_;
@@ -1689,6 +1706,7 @@ private:
         sampler_base_ = 0;
         topology_ = 0;
         vertex_buffers_ = {};
+        so_buffers_ = {};
         index_ = {};
         viewport_ = {};
         scissor_ = {};
@@ -1753,6 +1771,14 @@ private:
                                                                           views[i].StrideInBytes}
                                                : leonida::VertexBufferView{};
         }
+    }
+
+    void set_so_targets(UINT start, UINT count, const D3D12_STREAM_OUTPUT_BUFFER_VIEW* views) {
+        if (count) draw_views_stale_ = true;
+        for (UINT i = 0; i < count; ++i)
+            so_buffers_[start + i] = views ? leonida::SOBufferView{views[i].BufferLocation, views[i].SizeInBytes,
+                                                                   views[i].BufferFilledSizeLocation}
+                                           : leonida::SOBufferView{};
     }
 
     void set_index_buffer(const D3D12_INDEX_BUFFER_VIEW* view) {
@@ -1885,6 +1911,7 @@ private:
             auto views = std::make_shared<leonida::DrawViews>();
             views->render_targets = render_targets_;
             views->vertex_buffers = vertex_buffers_;
+            views->so_buffers = so_buffers_;
             views->render_target_count = render_target_count_;
             draw_views_ = std::move(views);
             draw_views_stale_ = false;

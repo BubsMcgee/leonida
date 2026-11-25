@@ -222,6 +222,11 @@ struct VulkanDeviceInfo {
     // VK_EXT_transform_feedback's geometryStreams feature is enabled when the device offers it. Nothing rasterizes a
     // StreamOutput RasterizedStream yet; it is here for the capture implementation that follows.
     bool transform_feedback_geometry_streams = false;
+    // VkPhysicalDeviceTransformFeedbackPropertiesEXT limits, read when VK_EXT_transform_feedback is enabled: a
+    // StreamOutput PSO's NumStrides must not exceed max_transform_feedback_buffers, and a non-default
+    // RasterizedStream must be below max_transform_feedback_streams. Both 0 when the extension is not enabled.
+    std::uint32_t max_transform_feedback_buffers = 0;
+    std::uint32_t max_transform_feedback_streams = 0;
     // The core features enabled on `device`. Graphics PSOs that need independentBlend, fillModeNonSolid,
     // depthBiasClamp or dualSrcBlend are refused unless it is set here.
     VkPhysicalDeviceFeatures features{};
