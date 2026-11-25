@@ -61,7 +61,25 @@ default when the title gives no size). Lazy per-page commit is possible but need
 - [ ] Optional: skip the splash cache entirely when only one consumer is enabled.
 - [ ] Optional: on `WM_ACTIVATEAPP` deactivation, trim the working set again (needs a window-proc hook).
 
-## 3. Task scheduling / resource allocation
+## 2b. Resolution and texture LOD (measured 2026-11-25, render-int-main)
+
+- The title sizes its PresentX output from the **window client area** (measured: a 1920x1080 request was fitted to
+  1818x993 and every captured plane was 1818x993). So the window/client size *is* the internal render resolution.
+- `LEONIDA_WINDOW=WxH` is the client (render) area, applied when the title creates its window (`lifecycle.cpp`) and
+  idempotently when the presenter attaches. `LEONIDA_RENDER_SCALE=0.25..1` scales the fitted client
+  (0.67 is about 1280x720 from 1920x1080).
+- Suggested "medium-low": `LEONIDA_WINDOW=1280x720` (or `LEONIDA_RENDER_SCALE=0.67`).
+- Texture detail without memory: `LEONIDA_TEXTURE_MIN_LOD` / `LEONIDA_TEXTURE_LOD_BIAS` (sampler LOD floor and
+  offset; image memory is unchanged). Aggressive: `=2` and `=2`.
+- Texture mass: `LEONIDA_TITLE_MEMORY_MB` (the title sizes its own pools; try 6144 then 4096),
+  `LEONIDA_TITLE_WINDOWS_MB` (shadow refresh budget, default 64; try 32), `LEONIDA_TITLE_IMAGE_STAGING`,
+  `LEONIDA_PLACED_IMAGE_DEFER`, and the 256 MiB zero-image cache.
+- Arena: 512, 1024 and 1536 all failed (`GPU address arena full` at FSR load, `CreateCommittedResource` failed, FSR
+  threw `0xe06d7363`). **2048 renders** (151 s, 22 non-black frames, 8,210 presents). Requests 6144 and 9216 both
+  resolve to **4080 MiB** (the 4095 MiB clamp, then the device's Resizable BAR cap; memory type 5, DL+HV+HC). To go
+  past 4080 the sparse/multi-buffer arena is needed, not a larger `LEONIDA_ARENA_MB`.
+
+
 
 - [x] `LEONIDA_PIPELINE_THREADS` already exists (`runtime/src/pipeline_workers.h:154`): default
   `min(8, logical_processors / 2)`; `0` compiles on the submitting thread. Read it before adding another knob.

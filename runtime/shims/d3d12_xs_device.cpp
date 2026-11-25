@@ -1692,13 +1692,19 @@ PresentState* present_state_for(DeviceProxy* device, bool splash_only = false) {
     PresentState* state = pending.get();
     if (!splash_only) device->present_state = pending.release();
     const bool titles = target != nullptr;
-    // LOCAL: LEONIDA_WINDOW=WxH resizes the title's window without waiting on its thread (SWP_ASYNCWINDOWPOS).
+    // LOCAL: LEONIDA_WINDOW=WxH is the client (render) area; resize only when the title's own sizing left it different
+    // (the window shim already applied it at creation) and without waiting on the title's thread.
     if (titles) {
         if (const char* size = std::getenv("LEONIDA_WINDOW")) {
             int w = 0, h = 0;
-            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
-                SetWindowPos(target, nullptr, 0, 0, w, h,
-                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_ASYNCWINDOWPOS);
+            if (std::sscanf(size, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                RECT client{};
+                RECT want{0, 0, w, h};
+                if (AdjustWindowRect(&want, GetWindowLongW(target, GWL_STYLE), FALSE) &&
+                    (!GetClientRect(target, &client) || client.right != w || client.bottom != h))
+                    SetWindowPos(target, nullptr, 0, 0, want.right - want.left, want.bottom - want.top,
+                                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOMOVE | SWP_ASYNCWINDOWPOS);
+            }
         }
     }
     if (!target) {

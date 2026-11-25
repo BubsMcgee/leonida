@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <thread>
 #include <utility>
@@ -147,10 +148,47 @@ bool prepare_title_window(HWND parent, DWORD style, DWORD ex_style, int& x, int&
     if (g_title_window.load() != nullptr) return true;
     RECT area{};
     if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &area, 0)) return true;
-    const auto [fitted_w, fitted_h] = fit_window_to_area(area, width, height);
+    auto [fitted_w, fitted_h] = fit_window_to_area(area, width, height);
+    // LEONIDA_WINDOW=WxH takes the client area directly; LEONIDA_RENDER_SCALE=0.25..1 scales the fitted client. The
+    // title renders its output at the client area it gets at creation (measured: the PresentX plane extent equals the
+    // client area), so sizing the window here lowers the internal resolution, not just the presentation. Both are
+    // client sizes, so the frame the window manager adds does not make the render target smaller again.
+    {
+        RECT bare{0, 0, 0, 0};
+        if (AdjustWindowRect(&bare, style, FALSE)) {
+            const int border_w = bare.right - bare.left, border_h = bare.bottom - bare.top;
+            int client_w = fitted_w - border_w, client_h = fitted_h - border_h;
+            bool sized = false;
+            if (const char* text = std::getenv("LEONIDA_WINDOW")) {
+                int w = 0, h = 0;
+                if (std::sscanf(text, "%dx%d", &w, &h) == 2 && w > 0 && h > 0) {
+                    client_w = w;
+                    client_h = h;
+                    sized = true;
+                }
+            }
+            if (!sized) {
+                if (const char* text = std::getenv("LEONIDA_RENDER_SCALE")) {
+                    const double scale = std::strtod(text, nullptr);
+                    if (scale > 0.0 && scale < 1.0) {
+                        client_w = static_cast<int>(client_w * scale + 0.5);
+                        client_h = static_cast<int>(client_h * scale + 0.5);
+                        sized = true;
+                    }
+                }
+            }
+            if (sized && client_w > 0 && client_h > 0) {
+                RECT win{0, 0, client_w, client_h};
+                if (AdjustWindowRect(&win, style, FALSE)) {
+                    fitted_w = win.right - win.left;
+                    fitted_h = win.bottom - win.top;
+                }
+            }
+        }
+    }
     if (fitted_w == width && fitted_h == height) return true;
-    std::fprintf(stderr, "[rt] lifecycle: fitted oversized title window %dx%d -> %dx%d\n", width, height, fitted_w,
-                 fitted_h);
+    std::fprintf(stderr, "[rt] lifecycle: title window %dx%d -> %dx%d (client %s)\n", width, height, fitted_w, fitted_h,
+                 std::getenv("LEONIDA_WINDOW") ? "LEONIDA_WINDOW" : (std::getenv("LEONIDA_RENDER_SCALE") ? "LEONIDA_RENDER_SCALE" : "fitted"));
     width = fitted_w;
     height = fitted_h;
     x = area.left + ((area.right - area.left) - width) / 2;
