@@ -76,6 +76,23 @@ How to read the states: game state `0x7446510` goes 1, 2 (init), 3 (running); se
 screen waiting for A), `d` after A. `docs/linux_proton.md` (the same stages apply natively)
 section 2 has the healthy sequence with times and section 3 "which blank do you have".
 
+## Warm the cache, then time a scene
+
+`warm.ps1` runs two boots: a long one that fills one `LEONIDA_PIPELINE_CACHE_DIR` (async builds on, workers above the
+title's threads) and a shorter one on that warmed cache, then checks the second run's per-window frame rate, presents,
+faults and non-black captures with [`tools/scene_timing.py`](../../tools/scene_timing.py).
+
+```powershell
+powershell -NoProfile -File scripts\windows-boot\warm.ps1 -Name first
+# a longer, stricter story-load check, with 8 compile workers:
+powershell -NoProfile -File scripts\windows-boot\warm.ps1 -Name story -WarmSeconds 300 -CheckSeconds 180 `
+    -StartAt 90 -MinFps 4 -Threads 8 -GameDir D:\GTA6pkg -Shaders E:\leonida-work\shaders\spirv
+```
+
+The compile knobs it sets are `LEONIDA_PIPELINE_CACHE_DIR`, `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1`,
+`LEONIDA_ASYNC_PIPELINES=1`, `LEONIDA_PIPELINE_PRIORITY=above` and (with `-Threads`) `LEONIDA_PIPELINE_THREADS`; the
+runtime needs `LEONIDA_SUBMIT_PHASES_SECONDS` non-zero (it sets 5) for the timing lines. `-DryRun` prints the plan.
+
 ## One game at a time
 
 The script holds the named mutex `Local\LeonidaGameBoot` for the whole boot and also waits while any `gta6rt.exe`
