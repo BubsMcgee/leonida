@@ -8104,6 +8104,20 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
     if (out.has_cs && out.has_graphics_stage) return stream_invalid("a compute stage with graphics stages");
     if (!out.has_cs && !out.has_graphics_stage)
         return stream_invalid("no shader stage in the pipeline state stream");
+    if (!out.has_cs) {
+        // PC D3D12 requires UNKNOWN render-target formats and empty blend state past NumRenderTargets; the console
+        // stream can leave values there (mesh streams do), and the layer's own validation reads all eight slots.
+        for (unsigned i = g.NumRenderTargets; i < D3D12_SIMULTANEOUS_RENDER_TARGET_COUNT; ++i) {
+            g.RTVFormats[i] = DXGI_FORMAT_UNKNOWN;
+            D3D12_RENDER_TARGET_BLEND_DESC& t = g.BlendState.RenderTarget[i];
+            t.BlendEnable = FALSE;
+            t.LogicOpEnable = FALSE;
+            t.LogicOp = D3D12_LOGIC_OP_NOOP;
+            t.SrcBlend = t.DestBlend = t.SrcBlendAlpha = t.DestBlendAlpha = D3D12_BLEND_ONE;
+            t.BlendOp = t.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+            t.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        }
+    }
     // Integer-target blend bypass (D3D-INTEGER-TARGET-BLEND-BYPASS): RDNA2 does not blend an integer target, so a
     // console stream can carry an enable bit on one that D3D12 would refuse. D3D12 refuses a logic op with
     // independent blending, and a valid shared logic-op state already has blending off, so that state is left alone.
