@@ -294,6 +294,34 @@ int overflow_and_bounds() {
     return 0;
 }
 
+// Chunk barriers and the placement window (a sparse arena's chunk boundaries, and the low range its descriptor
+// heaps keep): no allocation crosses a barrier, release does not merge across one, and a window keeps a search in a
+// range even when another range has room.
+int barriers_and_window() {
+    Blocks b;
+    b.reset(kReserved, kSize);
+    const std::uint64_t barrier = kReserved + 0x40000;
+    const std::uint64_t barrier2 = kReserved + 0x80000;
+    b.set_barriers({barrier, barrier2});
+    EXPECT(b.check() == Blocks::Fault::none && b.consistent(0));
+    EXPECT(b.count() == 3);  // the free block was split at both barriers
+    std::uint64_t low = 0, high = 0, out = 0;
+    EXPECT(b.allocate(0x30000, kAlign, no_keep_out, low) && low + 0x30000 <= barrier);
+    EXPECT(b.allocate(0x30000, kAlign, no_keep_out, high) && high >= barrier);
+    // The window keeps a search in one chunk even when the other has room.
+    EXPECT(!b.allocate(0x100000, kAlign, no_keep_out, out, 0, barrier));  // wider than the low chunk
+    EXPECT(b.allocate(0x1000, kAlign, no_keep_out, out, barrier, kSize) && out >= barrier);
+    EXPECT(b.allocate(0x1000, kAlign, no_keep_out, out, 0, barrier) && out < barrier);
+    // Release merges only up to a barrier: no free block may span one.
+    EXPECT(b.release(low, 0x30000) == Blocks::Fault::none);
+    EXPECT(b.check() == Blocks::Fault::none);
+    for (const auto& block : b.blocks()) {
+        for (const std::uint64_t at : {barrier, barrier2})
+            EXPECT(!(block.offset < at && at < block.offset + block.size));
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main() {
@@ -306,6 +334,7 @@ int main() {
     if (int r = reader()) return r;
     if (int r = threads()) return r;
     if (int r = overflow_and_bounds()) return r;
+    if (int r = barriers_and_window()) return r;
     std::fprintf(stderr, "arena_blocks: ok\n");
     return 0;
 }

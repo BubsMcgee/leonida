@@ -38,6 +38,7 @@ public:
     // (kArenaReserved in the device), which no resource may have.
     void reset(std::uint64_t reserved, std::uint64_t size) {
         blocks_.clear();
+        barriers_.clear();
         reserved_ = reserved;
         size_ = size;
         free_bytes_ = size > reserved ? size - reserved : 0;
@@ -48,31 +49,70 @@ public:
         interrupted_ = false;
     }
 
-    // First fit of `bytes` at `alignment`: `keep_out(lo, hi)` returns the end of a range of the arena no
-    // allocation may cover that overlaps [lo, hi), or 0 when there is none (the device passes the title's own
-    // memory through src/title_va_alias.h). False when no free block holds the request.
+    // Offsets no allocation may cross, and where release() stops merging: a sparse arena's chunk boundaries, where
+    // the host mapping changes. Each chunk is one VkDeviceMemory, so an allocation that crossed a boundary would
+    // not have a contiguous host pointer. Splits the free blocks as they are now.
+    void set_barriers(std::vector<std::uint64_t> barriers) {
+        barriers_.clear();
+        for (std::uint64_t barrier : barriers)
+            if (barrier > reserved_ && barrier < size_) barriers_.push_back(barrier);
+        std::sort(barriers_.begin(), barriers_.end());
+        barriers_.erase(std::unique(barriers_.begin(), barriers_.end()), barriers_.end());
+        if (barriers_.empty()) return;
+        Map split;
+        for (const auto& [offset, length] : blocks_) {
+            std::uint64_t start = offset, end = offset + length;
+            for (std::uint64_t barrier : barriers_) {
+                if (barrier <= start) continue;
+                if (barrier >= end) break;
+                split.emplace(start, barrier - start);
+                start = barrier;
+            }
+            split.emplace(start, end - start);
+        }
+        blocks_ = std::move(split);
+        ++cuts_;
+    }
+
+    // First fit of `bytes` at `alignment` inside [min_offset, max_offset) (defaults: the whole arena): `keep_out(lo,
+    // hi)` returns the end of a range of the arena no allocation may cover that overlaps [lo, hi), or 0 when there is
+    // none (the device passes the title's own memory through src/title_va_alias.h). False when no free block holds the
+    // request. The window keeps 32-bit-sensitive ranges (descriptor heaps, shader code) below 4 GiB and places
+    // buffers above a sparse arena's first chunk first.
     template<typename KeepOut>
-    bool allocate(std::uint64_t bytes, std::uint64_t alignment, KeepOut&& keep_out, std::uint64_t& out) {
-        if (!bytes || !alignment || bytes > size_) return false;
+    bool allocate(std::uint64_t bytes, std::uint64_t alignment, KeepOut&& keep_out, std::uint64_t& out,
+                  std::uint64_t min_offset = 0, std::uint64_t max_offset = UINT64_MAX) {
+        const std::uint64_t window_lo = std::max(reserved_, min_offset);
+        const std::uint64_t window_hi = std::min(size_, max_offset);
+        if (!bytes || !alignment || window_hi <= window_lo || bytes > window_hi - window_lo) return false;
         interrupted_ = false;
         // Blocks in offset order. A step carries only a block's offset and size; the iterator is gone before
         // keep_out() runs and the next block is looked up from the map again, so a cut made under the walk
         // (cuts() changed) is seen, and the search starts over on the map as it is now.
         for (int attempt = 0; attempt < kAttempts; ++attempt) {
             const std::uint64_t cuts = cuts_;
-            std::uint64_t cursor = reserved_;
+            std::uint64_t cursor = window_lo;
             for (;;) {
-                const auto next = blocks_.lower_bound(cursor);
+                auto next = blocks_.lower_bound(cursor);
+                // The block that starts before the window and reaches into it.
+                if (next == blocks_.end() || next->first > cursor) {
+                    if (next != blocks_.begin()) {
+                        const auto previous = std::prev(next);
+                        if (previous->first + previous->second > cursor) next = previous;
+                    }
+                }
                 if (next == blocks_.end()) return false;
                 const std::uint64_t block = next->first;
                 const std::uint64_t block_size = next->second;
-                const std::uint64_t end = block + block_size;
+                const std::uint64_t block_end = block + block_size;
+                if (block >= window_hi) return false;
+                const std::uint64_t end = std::min(block_end, window_hi);
                 std::uint64_t start = 0;
-                if (align_up(block, alignment, start)) {
+                if (end > window_lo && align_up(std::max(block, window_lo), alignment, start) && start < end) {
                     while (start < end && bytes <= end - start) {
                         const std::uint64_t keep_out_end = keep_out(start, start + bytes);
                         if (!keep_out_end) break;
-                        if (keep_out_end <= start || !align_up(keep_out_end, alignment, start)) {
+                        if (keep_out_end <= start || !align_up(keep_out_end, alignment, start) || start >= end) {
                             start = end;
                             break;
                         }
@@ -88,7 +128,7 @@ public:
                     out = start;
                     return true;
                 }
-                cursor = end;
+                cursor = block_end;
             }
             if (cuts_ == cuts) return false;  // nothing moved: a genuine refusal
         }
@@ -135,8 +175,16 @@ public:
             free_bytes_ -= it->second;
             it = blocks_.erase(it);
         }
-        blocks_.emplace(begin, end - begin);
-        free_bytes_ += end - begin;
+        const std::uint64_t merged_begin = begin, merged_end = end;
+        std::uint64_t split = merged_begin;
+        for (std::uint64_t barrier : barriers_) {
+            if (barrier <= split) continue;
+            if (barrier >= merged_end) break;
+            blocks_.emplace(split, barrier - split);
+            split = barrier;
+        }
+        blocks_.emplace(split, merged_end - split);
+        free_bytes_ += merged_end - merged_begin;
         ++cuts_;
         return note_fault(already_free ? Fault::double_free : Fault::none);
     }
@@ -249,6 +297,7 @@ private:
     }
 
     Map blocks_;  // offset -> size
+    std::vector<std::uint64_t> barriers_;  // sorted: no allocation crosses one, release does not merge across
     std::uint64_t reserved_ = 0, size_ = 0, free_bytes_ = 0, cuts_ = 0, faults_ = 0;
     Fault fault_ = Fault::none;
     bool interrupted_ = false;
