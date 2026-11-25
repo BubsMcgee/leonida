@@ -5669,7 +5669,7 @@ HRESULT create_pso_from_stream(DeviceProxy* self, const D3D12_PIPELINE_STATE_STR
         char value[2]{};
         return GetEnvironmentVariableA("LEONIDA_PSO_STREAM_AUDIT", value, sizeof(value)) == 1 && value[0] == '1';
     }();
-    if (audit && desc && (hr == E_NOTIMPL || hr == E_FAIL)) {
+    if (audit && desc && (hr == E_NOTIMPL || hr == E_FAIL || hr == E_INVALIDARG)) {
         try {
             audit_pso_stream(*desc, hr, used_console_stream);
         } catch (const std::bad_alloc&) {}

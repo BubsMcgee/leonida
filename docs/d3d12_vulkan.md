@@ -2448,9 +2448,11 @@ The trace will enumerate them.
   - The Vulkan backend selects console numbering when the PC reading fails or gives AS without MS and the
     console reading has a verified DXIL kind-13 mesh stage. Slot 86 keeps that selected layout with canonical
     tags and owned shader bytes so slot 55 can derive another PSO. `LEONIDA_XS_STREAM_ENUM=pc` selects PC only.
-  - With D3D12 tracing, each unsupported stream has one `PipelineStream::Refused` reason. Accepted mesh PSOs
-    have a separate `PipelineStream::Mesh` count. `LEONIDA_PSO_STREAM_AUDIT=1` also prints raw tags,
-    shader stages and FSSM hashes for unsupported or failed streams. The call number joins to the backend result.
+  - With D3D12 tracing, each refused stream has one `PipelineStream::Refused` reason: the `E_NOTIMPL` and the
+    `E_INVALIDARG` refusals both carry it. Accepted mesh PSOs have a separate `PipelineStream::Mesh` count.
+    `LEONIDA_PSO_STREAM_AUDIT=1` also prints raw tags, shader stages and FSSM hashes for refused streams. The call
+    number joins to the backend result. A refusal is also logged once with its reason, so a skipped pipeline shows
+    in the log without tracing.
   - `LEONIDA_PSO_PROFILE=1` measures wall time and calling-thread CPU time for each Vulkan pipeline creation.
     Begin and end records share an ID.
     Compute records distinguish warmup, dispatch and eager creation. Graphics records name the lazy recipe's
@@ -2460,7 +2462,8 @@ The trace will enumerate them.
   - The stream becomes the same descriptions `CreateGraphicsPipelineState` and `CreateComputePipelineState` take, so
     a VS stream builds the same PSO as the classic call.
   - `E_INVALIDARG`, as on the PC runtime: a type given twice, an unknown type, a truncated stream, MS with VS,
-    tessellation or GS, CS with a graphics stage, or no stage at all.
+    tessellation or GS, CS with a graphics stage, or no stage at all. Each of these refusals is logged once with
+    its reason.
   - `E_NOTIMPL` with a log, for what is not built yet: an AS, a depth-bounds test, view instancing.
   - `DEPTH_STENCIL2`'s per-face read and write masks go to each face's `VkStencilOpState` (the front face's in the
     description, the back face's beside it), so `OPTIONS14.IndependentFrontAndBackStencilRefMaskSupported` is TRUE:
