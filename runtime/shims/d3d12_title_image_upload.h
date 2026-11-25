@@ -38,7 +38,7 @@ public:
     template<class Device>
     bool write(Device& d, leonida::ResourceId id, const leonida::ResourceBinding& image,
                const xg_xs::Texture& layout, const std::uint8_t* tiled, std::vector<std::uint64_t>& columns,
-               bool inspect, bool& nonzero) {
+               bool inspect, bool& nonzero, unsigned first_mip = 0) {
         const auto block = leonida::copy_block_format(image, VK_IMAGE_ASPECT_COLOR_BIT);
         const auto mips = layout.layout.mips;
         const auto layers = layout.array;
@@ -48,7 +48,7 @@ public:
         regions_.clear();
         VkDeviceSize bytes = 0;
         for (unsigned layer = 0; layer < layers; ++layer) {
-            for (unsigned level = 0; level < mips; ++level) {
+            for (unsigned level = first_mip; level < mips; ++level) {
                 const auto& mip = layout.layout.plane[0].mips[level];
                 VkBufferImageCopy copy{};
                 copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, layer, 1};
@@ -81,7 +81,7 @@ public:
                                       [](std::uint8_t c) { return c != 0; });
         }
 
-        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, mips, 0, layers};
+        const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, first_mip, mips - first_mip, 0, layers};
         const auto result = d.context->write_staged_title_image(id, range, [&](const leonida::ReplayFunctions& replay,
                                                                                const leonida::LayoutPieces& pieces) {
             auto& vk = d.context->vk;

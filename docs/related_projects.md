@@ -122,6 +122,26 @@ lands), the IID/extension tables, and the call-sequence observations that Leonid
 [d3d12_vulkan.md §7](d3d12_vulkan.md#7-prior-art-and-measured-xbox-abi) still lists as unknown. SCARAB forwards to
 D3D12; Leonida translates to Vulkan. The ABI facts carry over, the forwarding architecture does not.
 
+## Marvisak/VIctory (DexNom Runtime)
+
+<https://github.com/DexNom/VIctory> (upstream <https://github.com/Marvisak/VIctory>)
+
+A Rust runtime for the same Xbox Series title and package: it runs the title's x64 code and translates its D3D12.X
+GPU work to host Direct3D 12, where this project targets Vulkan. The DexNom fork adds Radeon rendering and GPU-memory
+work and an experimental ray-tracing path (the title's builder/traversal run as translated compute shaders, with
+`image_bvh_intersect_ray`/`image_bvh64_intersect_ray` emulated in DXIL). Its `crates/victory-shader/src/bvh.rs` is a
+CPU reference for the node test and its `docs/architecture.md`/`docs/fork-ray-tracing.md` record the memory and
+builder design.
+
+**Licence:** GPL-3.0-or-later, compatible with this project's licence. As with SCARAB, **facts first**: verify a
+behaviour on our own package, write the implementation in our style, and say in the pull request which VIctory file a
+borrowed fact came from. Do not copy a whole component just because the licence allows it.
+
+**What we use it for:** the console ray-tracing node test and its lowering (`crates/victory-shader/src/bvh.rs`,
+`emit/intersect.rs`), raw-address title memory through a 64 KiB page directory, streamed-texture middle-page uploads,
+readback range merging, and the upload/transition worker policy — each re-implemented against our
+[docs/bvh.md](bvh.md) measurements and our runtime, not pasted.
+
 ## holdmysocks/SixNG
 
 <https://github.com/holdmysocks/SixNG>
