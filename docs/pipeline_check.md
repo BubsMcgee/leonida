@@ -457,6 +457,10 @@ driver gives it the same cache key in both programs. Measured on Windows with an
   `VK_KHR_maintenance8` into the pipeline cache key even for compute shaders, so the checker enables both whenever
   supported and keeps `meshShaderQueries` on.
 - On a Windows RTX 5070 Ti (617.42), a compute-only seed missed with mesh features omitted and hit with the supported mesh and mesh-query features enabled on both devices. The shader, push constants and pipeline layout were identical. Cache-producing runs request this device configuration for every selected shader batch.
+- On Windows with an AMD Radeon RX 7900 XT, `VK_EXT_transform_feedback` (with `transformFeedback` enabled, and
+  `geometryStreams` when the device offers it) is part of the key: the runtime enables it whenever the extension is
+  present (D3D-302), so the checker enables it too. Without it, `pipeline_cache_seed` failed 3 of 3 on that GPU and
+  passed 3 of 3 on `main`. NVIDIA leaves it out of the key, which is why it did not show up on the RTX 3080 Ti.
 - The executable's file name is part of the key; its folder is not. A copy of the checker under another name
   misses the cache the original wrote, and the runtime's device hits the checker's cache only from a program
   with the checker's file name. So on this driver a cache written by `vk_pipeline_check.exe` does not hit in
