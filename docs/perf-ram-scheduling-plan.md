@@ -65,9 +65,9 @@ default when the title gives no size). Lazy per-page commit is possible but need
 
 - [x] `LEONIDA_PIPELINE_THREADS` already exists (`runtime/src/pipeline_workers.h:154`): default
   `min(8, logical_processors / 2)`; `0` compiles on the submitting thread. Read it before adding another knob.
-- [ ] Merge `LEONIDA_PIPELINE_PRIORITY` + `PipelineWorkers::set_thread_start` from
-  `tools/warmup-scene-check` (`e605ce241`): compile workers can run above-normal so the render thread is not
-  starved and warmup finishes sooner.
+- [x] `LEONIDA_PIPELINE_PRIORITY` (`above`, `high`, `below`, `low`; normal when unset) and
+  `PipelineWorkers::set_thread_start` ported to this branch. Compile workers can run above-normal so the render thread
+  is not starved and warmup finishes sooner. Ported from `tools/warmup-scene-check` (`e605ce241`).
 - [ ] Physical-core cap: `hardware_concurrency()` counts logical CPUs. Cap compile workers to
   `min(physical_cores - 1, 8)` so the render/submit thread keeps a core.
 - [ ] Upload fairness: `TitleUploadBudget` (`runtime/src/title_staging.h`, on `title-streaming-workers`, not

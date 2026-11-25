@@ -42,6 +42,11 @@ public:
 
     unsigned threads() const { return limit_; }
 
+    // Called at the top of each worker thread, before it takes a job. The platform hook that sets the thread's
+    // priority (LEONIDA_PIPELINE_PRIORITY) is installed here, so this header needs no platform header (windows.h's
+    // `small`/`min`/`max` macros break callers). Empty by default.
+    static void set_thread_start(std::function<void()> hook) { thread_start() = std::move(hook); }
+
     // Calls job(0) .. job(count - 1) and returns when every call has returned. When calls threw, rethrows what the
     // lowest of them threw, after the last has returned. With no workers or a single job the calls are made in order on
     // this thread, and the first exception ends them.
@@ -82,6 +87,10 @@ public:
     }
 
 private:
+    static std::function<void()>& thread_start() {
+        static std::function<void()> hook;
+        return hook;
+    }
     struct Batch {  // on the stack of the run() that made it; guarded by mutex_
         const std::function<void(std::size_t)>* job;
         std::size_t count;
@@ -106,6 +115,7 @@ private:
     }
 
     void work() {
+        if (std::function<void()>& hook = thread_start()) hook();
         std::unique_lock lock(mutex_);
         for (;;) {
             work_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
