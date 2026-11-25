@@ -11,6 +11,11 @@ given twice with the same import search folder is inspected once. Reads the file
 The report also lists run-time load candidates: DLL names the image holds as ASCII or UTF-16 strings without
 importing them, where a LoadLibrary* the import table doesn't show would point (docs/runtime_imports.md).
 
+Each DLL's "where" is bundled (in the game folder, any case), system, shim or, on a host that isn't Windows and has
+no Wine prefix, unverified (classify_dll). On Windows, system means System32 or the OS API-set schema; elsewhere the
+Wine prefix's system32 ($WINEPREFIX, else ~/.wine) and its apisetschema.dll stand in, and the report's
+"system_dlls" says which was used.
+
 Standard library only: the headers, the section table, the import, delay-import, export, TLS and relocation
 directories are parsed with struct, so the tool runs under `python -I` without third-party packages and is covered
 by the same standard-library-only CI job as the other tools.
@@ -28,6 +33,10 @@ from collections import Counter
 from collections.abc import Iterator
 
 SYSTEM32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+# Whether this host is Windows: there SYSTEM32 and the OS API-set schema answer `system`; elsewhere a Wine prefix's
+# system32 does (classify_dll). A module flag so that a test can stand in for either host.
+IS_WINDOWS = os.name == "nt"
+RUNTIME_SHIMS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "runtime", "shims")
 
 MACHINES = {0x8664: "x86-64", 0x14C: "x86", 0xAA64: "ARM64"}
 SUBSYSTEMS = {2: "GUI", 3: "Console", 14: "Xbox"}
@@ -374,16 +383,193 @@ def dll_strings(data: bytes, imported: set[str], own_name: str | tuple[str, ...]
             for n, e in sorted(seen.items()) if n not in skip]
 
 
+# Host DLLs the runtime's shim registry does not own although a SHIM_TABLE lists them: only a few of their functions
+# are replaced (runtime/shims/registry.cpp, owns_dll). API sets are never owned either.
+_SHIM_HOST_DLLS = frozenset({"kernel32.dll", "kernelbase.dll", "msvcrt.dll", "ucrtbase.dll", "ucrtbased.dll",
+                             "vulkan-1.dll", "ntdll.dll", "user32.dll", "ws2_32.dll", "wsock32.dll",
+                             "advapi32.dll"})
+_SHIM_TABLE_DLL = re.compile(r'[{(]\s*"([A-Za-z0-9_.\-]+\.[dD][lL][lL])"\s*[,)]')
+_shim_dlls_cache: dict[str, frozenset[str]] = {}
+
+
+def _shim_table_bodies(text: str) -> list[str]:
+    """The argument text of every SHIM_TABLE(...) in a source file (parentheses matched; export names hold none)."""
+    bodies = []
+    at = text.find("SHIM_TABLE(")
+    while at >= 0:
+        start = i = at + len("SHIM_TABLE(")
+        depth = 1
+        while i < len(text) and depth:
+            depth += {"(": 1, ")": -1}.get(text[i], 0)
+            i += 1
+        bodies.append(text[start:i - 1])
+        at = text.find("SHIM_TABLE(", i)
+    return bodies
+
+
+def runtime_shim_dlls(folder: str = RUNTIME_SHIMS) -> frozenset[str]:
+    """Lower-cased names of the DLLs the runtime's shims own (owns_dll in runtime/shims/registry.cpp): every DLL a
+    SHIM_TABLE in `folder`'s .cpp files lists, less the host DLLs and API sets the registry only patches. Empty when
+    the sources are not there (a copy of this tool outside the repository)."""
+    key = os.path.abspath(folder)
+    if key not in _shim_dlls_cache:
+        names: set[str] = set()
+        try:
+            files = sorted(n for n in os.listdir(folder) if n.endswith(".cpp"))
+        except OSError:
+            files = []
+        for n in files:
+            try:
+                with open(os.path.join(folder, n), encoding="utf-8", errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for body in _shim_table_bodies(text):
+                names.update(m.lower() for m in _SHIM_TABLE_DLL.findall(body))
+        _shim_dlls_cache[key] = frozenset(
+            n for n in names if n not in _SHIM_HOST_DLLS and not n.startswith(("api-ms-", "ext-ms-")))
+    return _shim_dlls_cache[key]
+
+
+_listing_cache: dict[tuple[str, int], dict[str, str]] = {}
+
+
+def _file_names(folder: str) -> dict[str, str]:
+    """{lower-cased name: name on disk} of the files in `folder` (empty when it can't be read). Read once per folder
+    state: the key holds the folder's mtime, which changes when a file is added, removed or renamed."""
+    try:
+        stamp = os.stat(folder).st_mtime_ns
+    except OSError:
+        return {}
+    key = (os.path.abspath(folder), stamp)
+    if key not in _listing_cache:
+        try:
+            with os.scandir(folder) as entries:
+                _listing_cache[key] = {e.name.lower(): e.name for e in entries if e.is_file()}
+        except OSError:
+            _listing_cache[key] = {}
+    return _listing_cache[key]
+
+
+def wine_system32() -> str | None:
+    """On a host that isn't Windows, the Wine prefix's system32, which stands in for System32:
+    $WINEPREFIX/drive_c/windows/system32 when WINEPREFIX is set, else ~/.wine's. None when that folder is missing (a
+    WINEPREFIX that names no prefix is not replaced by ~/.wine, which would answer for another prefix)."""
+    prefix = os.environ.get("WINEPREFIX") or os.path.join(os.path.expanduser("~"), ".wine")
+    path = os.path.join(prefix, "drive_c", "windows", "system32")
+    return path if os.path.isdir(path) else None
+
+
+def system_dll_source() -> tuple[str, str | None]:
+    """Where `system` is checked on this host: ("windows", SYSTEM32), ("wine-prefix", <the prefix's system32>), or
+    ("none", None) on a host that isn't Windows and has no Wine prefix."""
+    if IS_WINDOWS:
+        return "windows", SYSTEM32
+    path = wine_system32()
+    return ("wine-prefix", path) if path else ("none", None)
+
+
+_wine_apiset_cache: dict[tuple[str, int], frozenset[str]] = {}
+
+
+def _schema_contracts(data: bytes) -> frozenset[str]:
+    """The contracts an API-set schema (an .apiset section) maps to a host DLL. Version 6 only, the layout of
+    Windows 10 and later and of Wine: a header of version, size, flags, count, entry offset, hash offset and hash
+    factor; a 24-byte namespace entry of flags, name offset, name length, hashed length, value offset and value count;
+    a 20-byte value entry of flags, name offset, name length, value offset and value length. Each contract is the
+    lower-cased name cut at its hashed length (up to the last hyphen), which is what a lookup compares."""
+    if len(data) < 28 or struct.unpack_from("<I", data, 0)[0] != 6:
+        return frozenset()
+    count, entries = struct.unpack_from("<II", data, 12)
+    found = set()
+    for i in range(min(count, MAX_ENTRIES)):
+        at = entries + i * 24
+        if at + 24 > len(data):
+            break
+        _flags, name_at, _name_len, hashed_len, values_at, value_count = struct.unpack_from("<6I", data, at)
+        if name_at + hashed_len > len(data):
+            continue
+        hosts = 0
+        for v in range(min(value_count, MAX_ENTRIES)):
+            value = values_at + v * 20
+            if value + 20 > len(data):
+                break
+            hosts += struct.unpack_from("<I", data, value + 16)[0] > 0
+        if hosts:
+            found.add(data[name_at:name_at + hashed_len].decode("utf-16-le", errors="replace").lower())
+    return frozenset(found)
+
+
+def wine_apisets(system32: str) -> frozenset[str]:
+    """The API-set contracts the prefix's apisetschema.dll resolves (_schema_contracts); empty when the file, its
+    .apiset section or a version-6 schema is missing. Wine resolves API sets this way and installs no file for most
+    of them."""
+    disk = _file_names(system32).get("apisetschema.dll")
+    if disk is None:
+        return frozenset()
+    path = os.path.join(system32, disk)
+    try:
+        key = (os.path.abspath(path), os.stat(path).st_mtime_ns)
+    except OSError:
+        return frozenset()
+    if key not in _wine_apiset_cache:
+        try:
+            with open(path, "rb") as f:
+                img = PeImage(f.read())
+            section = next((s for s in img.sections if s["name"] == ".apiset"), None)
+            _wine_apiset_cache[key] = _schema_contracts(img.section_data(section) if section else b"")
+        except (OSError, PeFormatError, struct.error):
+            _wine_apiset_cache[key] = frozenset()
+    return _wine_apiset_cache[key]
+
+
+def _apiset_key(name: str) -> str:
+    """An API-set name as a schema lookup compares it: lower case, without ".dll" and the part after the last
+    hyphen."""
+    base = name.lower()
+    if base.endswith(".dll"):
+        base = base[:-4]
+    return base.rsplit("-", 1)[0]
+
+
+def _bundled(name: str, game_dir: str | None) -> bool:
+    """Ships in the game folder, compared without case as Windows does: an import of MSVCP140.dll finds the package's
+    msvcp140.dll on a case-sensitive file system too."""
+    if not game_dir:
+        return False
+    return os.path.isfile(os.path.join(game_dir, name)) or name.lower() in _file_names(game_dir)
+
+
+# The values of an import's "where". "unverified" is reported only on a host that isn't Windows and has no Wine
+# prefix: the DLL is not bundled and the runtime's shims don't own it, so it is most likely a system DLL, but there
+# was nothing to check it against. The Markdown report shows it as "system (unverified)".
+CLASSES = ("bundled", "system", "shim", "unverified")
+LABELS = {"unverified": "system (unverified)"}
+
+
 def classify_dll(name: str, game_dir: str | None) -> str:
-    """bundled = ships beside the game, system = present on this Windows, shim = must be reimplemented."""
-    if game_dir and os.path.isfile(os.path.join(game_dir, name)):
+    """One of CLASSES. bundled = ships beside the game; system = present on this Windows, or in the Wine prefix's
+    system32 (or its API-set schema) on another host; shim = must be reimplemented; unverified = on a host that isn't
+    Windows and has no Wine prefix, neither bundled nor owned by the runtime's shims (runtime_shim_dlls)."""
+    if _bundled(name, game_dir):
         return "bundled"
     low = name.lower()
-    if low.startswith("api-ms-win-") or low.startswith("ext-ms-win-"):
-        # API sets resolve through the OS schema: ask this Windows whether it knows the contract.
-        return "system" if _apiset_resolves(name) else "shim"
-    if os.path.isfile(os.path.join(SYSTEM32, name)):
+    apiset = low.startswith("api-ms-win-") or low.startswith("ext-ms-win-")
+    if IS_WINDOWS:
+        if apiset:
+            # API sets resolve through the OS schema: ask this Windows whether it knows the contract.
+            return "system" if _apiset_resolves(name) else "shim"
+        if os.path.isfile(os.path.join(SYSTEM32, name)):
+            return "system"
+        return "shim"
+    system32 = wine_system32()
+    if system32 is None:
+        # Nothing to check against: only a module the runtime's shims own is known to need a shim.
+        return "shim" if not apiset and low in runtime_shim_dlls() else "unverified"
+    if low in _file_names(system32):
         return "system"
+    if apiset:
+        return "system" if _apiset_key(name) in wine_apisets(system32) else "shim"
     return "shim"
 
 
@@ -423,6 +609,7 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         entry["where"] = classify_dll(entry["name"], game_dir)
     pdata_rva, pdata_size = img.directory(DIR_EXCEPTION)
     reloc_rva, reloc_size = img.directory(DIR_BASERELOC)
+    checked, system_dir = system_dll_source()
 
     return {
         "file": os.path.basename(path),
@@ -443,7 +630,21 @@ def _inspect(path: str, game_dir: str | None) -> dict:
         "pdata_functions": pdata_size // 12 if pdata_rva and pdata_size >= 12 else 0,
         "tls_callbacks": _tls_callbacks(img),
         "runtime_load_candidates": loads,
+        # Where `system` was checked: "windows" (System32 and the OS API-set schema), "wine-prefix" (its system32
+        # and apisetschema.dll) or "none" (no Wine prefix on a host that isn't Windows: see "unverified").
+        "system_dlls": {"checked": checked, "dir": system_dir},
     }
+
+
+def system_dlls_note(r: dict) -> str | None:
+    """One line on where system DLLs were checked, for a report made on a host that isn't Windows; None otherwise."""
+    info = r.get("system_dlls") or {}
+    if info.get("checked") == "wine-prefix":
+        return f"System DLLs checked in the Wine prefix's `{info['dir']}`."
+    if info.get("checked") == "none":
+        return ("System DLLs could not be checked: no Wine prefix (set `WINEPREFIX`, or make `~/.wine`). A DLL that "
+                "is not bundled and that the runtime's shims don't own is listed as `system (unverified)`.")
+    return None
 
 
 def to_markdown(r: dict) -> str:
@@ -461,17 +662,21 @@ def to_markdown(r: dict) -> str:
     by_where = Counter()
     for imp in r["imports"]:
         by_where[imp["where"]] += len(imp["functions"])
-    out.append(", ".join(f"{k}: {v}" for k, v in sorted(by_where.items())) or "none")
+    out.append(", ".join(f"{LABELS.get(k, k)}: {v}" for k, v in sorted(by_where.items())) or "none")
+    note = system_dlls_note(r)
+    if note:
+        out += ["", note]
     out += ["", "| dll | kind | resolves | functions |", "|---|---|---|---|"]
     for imp in sorted(r["imports"], key=lambda i: (i["where"] != "shim", i["dll"].lower())):
-        out.append(f"| {imp['dll']} | {imp['kind']} | {imp['where']} | {len(imp['functions'])} |")
+        out.append(f"| {imp['dll']} | {imp['kind']} | {LABELS.get(imp['where'], imp['where'])} | "
+                   f"{len(imp['functions'])} |")
     loads = r.get("runtime_load_candidates", [])
     if loads:
         out += ["", "## Run-time load candidates", "",
                 "DLL names held as strings but not imported: a `LoadLibrary*` the import table doesn't show "
                 "(a string is where to look, not proof of a load).", "",
                 "| dll | encoding | resolves |", "|---|---|---|"]
-        out += [f"| {d['name']} | {d['encoding']} | {d['where']} |" for d in loads]
+        out += [f"| {d['name']} | {d['encoding']} | {LABELS.get(d['where'], d['where'])} |" for d in loads]
     shims = [i for i in r["imports"] if i["where"] == "shim"]
     if shims:
         out += ["", "## Needs checking or a shim", ""]
@@ -515,6 +720,7 @@ def main(argv: list[str] | None = None) -> int:
     rc = 0
     seen_paths: set[tuple[str, str]] = set()
     used_names: set[str] = set()
+    notes: list[str] = []
     for img in a.image:
         search_dir = a.game_dir or os.path.dirname(os.path.abspath(img))
         key = (os.path.normcase(os.path.realpath(img)), os.path.normcase(os.path.abspath(search_dir)))
@@ -565,8 +771,15 @@ def main(argv: list[str] | None = None) -> int:
             continue
         enc = [s["name"] for s in r["sections"] if s["looks_encrypted"]]
         shim = sum(len(i["functions"]) for i in r["imports"] if i["where"] == "shim")
+        unverified = sum(len(i["functions"]) for i in r["imports"] if i["where"] == "unverified")
         print(f"{r['file']:<40} {r['machine']:<7} subsys={r['subsystem']!s:<7} pdata={r['pdata_functions']:<7} "
-              f"shim-imports={shim:<5} encrypted={','.join(enc) or '-'}")
+              f"shim-imports={shim:<5} encrypted={','.join(enc) or '-'}"
+              + (f" unverified-imports={unverified}" if unverified else ""))
+        note = system_dlls_note(r)
+        if note and note not in notes:
+            notes.append(note)
+    for note in notes:  # once per run, after the per-image lines; only on a host that isn't Windows
+        print(note.replace("`", ""))
     return rc
 
 

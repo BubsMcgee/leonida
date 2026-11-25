@@ -10,11 +10,13 @@ import contextlib
 import io
 import json
 import os
+import re
 import struct
 import sys
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -974,6 +976,201 @@ class SectionBoundaryReadTest(unittest.TestCase):
                 image2[0x3FE:0x400] = straddle[:2]
                 image2[b_raw2:b_raw2 + width - 2] = straddle[2:]
                 self.assertEqual(pe_inspect._tls_callbacks(pe_inspect.PeImage(bytes(image2))), 1)
+
+
+def build_apiset_schema(contracts: dict[str, str]) -> bytes:
+    """A version-6 API-set schema: {contract name without ".dll": host DLL, or "" for a contract with no host}."""
+    header, entry, value = 28, 24, 20
+    strings = bytearray()
+    offset = header + len(contracts) * (entry + value)
+    entries, values = bytearray(), bytearray()
+    for i, (name, host) in enumerate(contracts.items()):
+        name_at = offset + len(strings)
+        strings += name.encode("utf-16-le")
+        host_at = offset + len(strings)
+        strings += host.encode("utf-16-le")
+        hashed = name.rindex("-") * 2
+        value_at = header + len(contracts) * entry + i * value
+        entries += struct.pack("<6I", 0, name_at, len(name) * 2, hashed, value_at, 1)
+        values += struct.pack("<5I", 0, 0, 0, host_at, len(host) * 2)
+    body = entries + values + strings
+    return struct.pack("<7I", 6, header + len(body), 0, len(contracts), header, 0, 31) + body
+
+
+def build_apiset_dll(schema: bytes) -> bytes:
+    """A 64-bit image whose one section is the .apiset section Wine's apisetschema.dll carries."""
+    raw = 0x200
+    size = (len(schema) + 0x1FF) & ~0x1FF
+    buf = bytearray(raw + size)
+    buf[0:2] = b"MZ"
+    struct.pack_into("<I", buf, 0x3C, 0x40)
+    buf[0x40:0x44] = b"PE\0\0"
+    struct.pack_into("<HHIIIHH", buf, 0x44, 0x8664, 1, 0, 0, 0, 240, 0x2022)
+    struct.pack_into("<H", buf, 0x58, 0x20B)
+    struct.pack_into("<Q", buf, 0x58 + 24, IMAGE_BASE)
+    struct.pack_into("<I", buf, 0x58 + 56, 0x1000 + size)
+    struct.pack_into("<I", buf, 0x58 + 60, raw)
+    struct.pack_into("<I", buf, 0x58 + 108, 16)
+    section = 0x58 + 240
+    buf[section:section + 8] = b".apiset\0"
+    struct.pack_into("<IIII", buf, section + 8, len(schema), 0x1000, size, raw)
+    struct.pack_into("<I", buf, section + 36, 0x40000040)  # initialized data, readable
+    buf[raw:raw + len(schema)] = schema
+    return bytes(buf)
+
+
+class HostClassesTest(unittest.TestCase):
+    """classify_dll on a host that isn't Windows (a Wine prefix's system32, or none) and on Windows, simulated by
+    patching IS_WINDOWS and SYSTEM32, so every branch runs on every OS."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        env = mock.patch.dict(os.environ, {"WINEPREFIX": os.path.join(self.dir, "no-such-prefix")})
+        env.start()
+        self.addCleanup(env.stop)
+        self.host(windows=False)
+
+    def host(self, windows: bool, system32: str | None = None):
+        for name, value in (("IS_WINDOWS", windows), ("SYSTEM32", system32 or pe_inspect.SYSTEM32)):
+            patch = mock.patch.object(pe_inspect, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def folder(self, *parts: str, files=()) -> str:
+        path = os.path.join(self.dir, *parts)
+        os.makedirs(path, exist_ok=True)
+        for name in files:
+            open(os.path.join(path, name), "wb").close()
+        return path
+
+    def prefix(self, files=(), schema: dict[str, str] | None = None) -> str:
+        """A fake Wine prefix whose system32 holds `files` (and an apisetschema.dll for `schema`); made current."""
+        root = os.path.join(self.dir, "prefix")
+        system32 = self.folder("prefix", "drive_c", "windows", "system32", files=files)
+        if schema is not None:
+            with open(os.path.join(system32, "apisetschema.dll"), "wb") as f:
+                f.write(build_apiset_dll(build_apiset_schema(schema)))
+        os.environ["WINEPREFIX"] = root
+        return system32
+
+    def report(self, game_dir: str | None = None) -> dict:
+        path = os.path.join(self.dir, "image.dll")
+        with open(path, "wb") as f:
+            f.write(build_image())
+        return pe_inspect.inspect(path, game_dir)
+
+    def test_bundled_names_compare_without_case(self):
+        game = self.folder("game", files=("msvcp140.dll", "Bink2.DLL"))
+        os.makedirs(os.path.join(game, "folder.dll"))
+        for windows in (False, True):
+            with self.subTest(windows=windows):
+                self.host(windows)
+                self.assertEqual(pe_inspect.classify_dll("MSVCP140.dll", game), "bundled")
+                self.assertEqual(pe_inspect.classify_dll("bink2.dll", game), "bundled")
+                self.assertNotEqual(pe_inspect.classify_dll("folder.dll", game), "bundled", "a folder isn't a DLL")
+        # A file added after the folder was first listed is seen too.
+        self.host(False)
+        open(os.path.join(game, "Late.dll"), "wb").close()
+        os.utime(game, ns=(os.stat(game).st_atime_ns, os.stat(game).st_mtime_ns + 1_000_000))
+        self.assertEqual(pe_inspect.classify_dll("LATE.dll", game), "bundled")
+
+    def test_wine_prefix_system32_is_compared_without_case(self):
+        system32 = self.prefix(files=("KERNEL32.dll", "advapi32.dll", "winhttp.dll"))
+        self.assertEqual(pe_inspect.classify_dll("kernel32.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("ADVAPI32.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("WinHttp.dll", None), "system", "as on Windows, where it's in System32")
+        self.assertEqual(pe_inspect.classify_dll("contoso.dll", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", None), "shim")
+        self.assertEqual(pe_inspect.system_dll_source(), ("wine-prefix", system32))
+        r = self.report()
+        self.assertEqual(r["system_dlls"], {"checked": "wine-prefix", "dir": system32})
+        where = {i["dll"]: i["where"] for i in r["imports"]}
+        self.assertEqual((where["kernel32.dll"], where["xmem.dll"]), ("system", "shim"))
+        self.assertIn(f"System DLLs checked in the Wine prefix's `{system32}`.", pe_inspect.to_markdown(r))
+
+    def test_home_wine_prefix_when_wineprefix_is_unset(self):
+        home = self.folder("home")
+        system32 = self.folder("home", ".wine", "drive_c", "windows", "system32", files=("kernel32.dll",))
+        del os.environ["WINEPREFIX"]
+        with mock.patch.dict(os.environ, {"HOME": home, "USERPROFILE": home}):
+            self.assertEqual(pe_inspect.wine_system32(), system32)
+            self.assertEqual(pe_inspect.classify_dll("Kernel32.dll", None), "system")
+
+    def test_no_prefix_reports_unverified_except_what_the_shims_own(self):
+        self.assertIsNone(pe_inspect.wine_system32())
+        self.assertEqual(pe_inspect.classify_dll("contoso.dll", None), "unverified")
+        self.assertEqual(pe_inspect.classify_dll("kernel32.dll", None), "unverified", "a host DLL the shims patch")
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("XMEM.DLL", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("D3D12_xs.dll", None), "shim")
+        game = self.folder("game", files=("XMEM.dll",))
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", game), "bundled")
+        r = self.report()
+        self.assertEqual(r["system_dlls"], {"checked": "none", "dir": None})
+        md = pe_inspect.to_markdown(r)
+        self.assertIn("| kernel32.dll | normal | system (unverified) | 1 |", md)
+        self.assertIn("| xmem.dll | normal | shim | 1 |", md)
+        self.assertIn("System DLLs could not be checked: no Wine prefix", md)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(pe_inspect.main([os.path.join(self.dir, "image.dll"),
+                                              "--out", os.path.join(self.dir, "reports")]), 0)
+        self.assertIn("shim-imports=2 ", out.getvalue(), "xmem.dll, imported and delay-imported")
+        self.assertIn("unverified-imports=1", out.getvalue(), "kernel32.dll")
+        self.assertIn("System DLLs could not be checked", out.getvalue())
+
+    def test_api_sets_on_a_host_that_is_not_windows(self):
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-synch-l1-2-0.dll", None), "unverified",
+                         "no prefix: an API set is never a shim the runtime owns")
+        self.prefix(files=("api-ms-win-crt-runtime-l1-1-0.dll",),
+                    schema={"api-ms-win-core-synch-l1-2-0": "kernelbase.dll", "api-ms-win-core-empty-l1-1-0": "",
+                            "ext-ms-win-gdi-dc-l1-2-0": "gdi32.dll"})
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-synch-l1-2-0.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("API-MS-WIN-Core-Synch-L1-2-1.dll", None), "system",
+                         "a lookup compares the name up to its last hyphen")
+        self.assertEqual(pe_inspect.classify_dll("ext-ms-win-gdi-dc-l1-2-0.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-empty-l1-1-0.dll", None), "shim", "no host")
+        self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-missing-l1-1-0.dll", None), "shim")
+        self.assertEqual(pe_inspect.classify_dll("API-MS-WIN-CRT-RUNTIME-L1-1-0.DLL", None), "system", "the file")
+
+    def test_windows_classification_is_unchanged(self):
+        system32 = self.folder("System32", files=("kernel32.dll",))
+        self.host(True, system32)
+        self.prefix(files=("contoso.dll", "kernel32.dll"))  # a Wine prefix is not consulted on Windows
+        self.assertEqual(pe_inspect.system_dll_source(), ("windows", system32))
+        self.assertEqual(pe_inspect.classify_dll("kernel32.dll", None), "system")
+        self.assertEqual(pe_inspect.classify_dll("contoso.dll", None), "shim", "never unverified on Windows")
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", None), "shim")
+        for resolves, expected in ((True, "system"), (False, "shim")):
+            with mock.patch.object(pe_inspect, "_apiset_resolves", lambda name, r=resolves: r):
+                self.assertEqual(pe_inspect.classify_dll("api-ms-win-core-synch-l1-2-0.dll", None), expected)
+        game = self.folder("game", files=("xmem.dll",))
+        self.assertEqual(pe_inspect.classify_dll("xmem.dll", game), "bundled")
+        r = self.report()
+        self.assertEqual(r["system_dlls"], {"checked": "windows", "dir": system32})
+        md = pe_inspect.to_markdown(r)
+        self.assertNotIn("System DLLs", md, "the Windows report reads as before")
+        self.assertIn("| kernel32.dll | normal | system | 1 |", md)
+
+    def test_runtime_shim_dlls_follow_the_registry(self):
+        owned = pe_inspect.runtime_shim_dlls()
+        self.assertTrue({"xmem.dll", "d3d12_xs.dll"} <= owned, owned)
+        self.assertFalse({"kernel32.dll", "kernelbase.dll", "msvcrt.dll"} & owned)
+        self.assertFalse([n for n in owned if n.startswith(("api-ms-", "ext-ms-"))])
+        with open(os.path.join(ROOT, "runtime", "shims", "registry.cpp"), encoding="utf-8") as f:
+            text = f.read()
+        body = text[text.index("bool owns_dll("):]
+        host = body[body.index("host[] = {") + len("host[] = {"):body.index("};")]
+        self.assertEqual(set(re.findall(r'"([^"]+)"', host)), set(pe_inspect._SHIM_HOST_DLLS),
+                         "_SHIM_HOST_DLLS is owns_dll's host list")
+        src = self.folder("shims")
+        with open(os.path.join(src, "a.cpp"), "w", encoding="utf-8", newline="\n") as f:
+            f.write('static const char* x = "notatable.dll";\nfind("alsonot.dll", "f");\n'
+                    'SHIM_TABLE(a,\n    {"Foo.dll", "F", reinterpret_cast<void*>(&f)},\n    MACRO("bar.dll"),\n'
+                    '    {"kernel32.dll", "K", nullptr},\n    MACRO("api-ms-win-core-file-l1-1-0.dll"),\n);\n')
+        self.assertEqual(pe_inspect.runtime_shim_dlls(src), {"foo.dll", "bar.dll"})
+        self.assertEqual(pe_inspect.runtime_shim_dlls(os.path.join(self.dir, "missing")), frozenset())
 
 
 if __name__ == "__main__":
