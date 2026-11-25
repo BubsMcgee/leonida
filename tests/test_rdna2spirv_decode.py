@@ -483,6 +483,50 @@ class TestTranslateIntegrationBoundaryChecks(unittest.TestCase):
                 with self.assertRaisesRegex(rdna2spirv.Unsupported, "reachable instruction with normalized encoding"):
                     rdna2spirv.translate(src)
 
+    def test_exact_anchoring_restores_dot4_inline_sel(self):
+        # FSPX programs of the FidelityFX DLL: llvm-mc decodes a v_dot4_i32_i8 whose src1 is an inline integer and
+        # prints op_sel_hi[1] set where the program's word has it clear (restore_dot4_inline_sel). When the listing's
+        # undecodable words sit at offsets its llvm-mc messages name (llvm-mc 23 names each one, so the re-anchoring
+        # is exact), that restore has to apply as well: it did not, the instruction was "normalized" and the program
+        # refused (2 of the 29 FSPX programs with llvm-mc 23.1.6).
+        mov0 = [0xF2, 0x02, 0x00, 0x7E]                                  # v_mov_b32_e32 v0, 1.0
+        mov1 = [0xF2, 0x02, 0x02, 0x7E]                                  # v_mov_b32_e32 v1, 1.0
+        dot_raw = [0x00, 0x40, 0x16, 0xCC, 0x01, 0x15, 0x01, 0x0C]      # op_sel_hi:[1,0,1]
+        dot_printed = [0x00, 0x40, 0x16, 0xCC, 0x01, 0x15, 0x01, 0x1C]  # llvm-mc's default [1,1,1]
+        export = [0x0F, 0x18, 0x00, 0xF8, 0x00, 0x01, 0x00, 0x01]
+        endpgm = [0x00, 0x00, 0x81, 0xBF]
+        data = [0xFF, 0xFF, 0xFF, 0xFF]                                  # a word llvm-mc rejected, after the end
+
+        def enc(words):
+            return ",".join(f"0x{b:02x}" for b in words)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            disasm = os.path.join(tmp, "disasm")
+            fssm = os.path.join(tmp, "fssm")
+            os.makedirs(disasm)
+            os.makedirs(fssm)
+            with open(os.path.join(tmp, "ps_dot.dxbc"), "wb") as f:
+                f.write(STUB_DXBC)
+            with open(os.path.join(fssm, "ps_dot.fssm"), "wb") as f:
+                f.write(bytes(mov0 + mov1 + dot_raw + export + endpgm + data))
+            shader_text = (
+                "; ps_dot  code 0x0..0x20 (fssm), gfx1030, 1 invalid words\n"
+                f"\tv_mov_b32_e32 v0, 1.0 ; encoding: [{enc(mov0)}]\n"
+                f"\tv_mov_b32_e32 v1, 1.0 ; encoding: [{enc(mov1)}]\n"
+                f"\tv_dot4_i32_i8 v0, v1, 10, v0 ; encoding: [{enc(dot_printed)}]\n"
+                f"\texp mrt0 v0, v1, v0, v1 done vm ; encoding: [{enc(export)}]\n"
+                f"\ts_endpgm ; encoding: [{enc(endpgm)}]\n"
+                "\n; --- llvm-mc messages ---\n"
+                "; <stdin>:8:1: warning: invalid instruction encoding\n"
+            )
+            src = os.path.join(disasm, "ps_dot.s")
+            with open(src, "w", encoding="utf-8") as f:
+                f.write(shader_text)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", ResourceWarning)
+                text = rdna2spirv.translate(src)
+        self.assertTrue(text)
+
     def test_invalid_opcode_in_shader_listing(self):
         with tempfile.TemporaryDirectory() as tmp:
             disasm = os.path.join(tmp, "disasm")
