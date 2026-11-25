@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <memory>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
@@ -16,6 +18,26 @@ namespace rt::package_splash {
 namespace {
 using Microsoft::WRL::ComPtr;
 std::filesystem::path image_path;
+
+// The GDI paint and the D3D12 splash texture used to decode and Fant-scale the WIC image separately. One decode is
+// shared by client size, and dropped as soon as both consumers have taken their copy, so the image does not stay
+// resident for the life of the process.
+std::mutex cache_mutex;
+struct SplashPixels {
+    UINT width = 0, height = 0;
+    std::shared_ptr<const std::vector<BYTE>> pixels;
+};
+SplashPixels cache;
+std::atomic<bool> window_painted{false};
+std::atomic<bool> texture_made{false};
+
+void clear_cache_locked() { cache = {}; }
+
+void maybe_release_cache() {
+    if (!window_painted.load(std::memory_order_relaxed) || !texture_made.load(std::memory_order_relaxed)) return;
+    std::lock_guard lock(cache_mutex);
+    clear_cache_locked();
+}
 
 std::filesystem::path declared_image(const std::filesystem::path& package, const wchar_t* manifest,
                                      const wchar_t* element, const wchar_t* attribute) {
@@ -80,8 +102,12 @@ std::vector<BYTE> decode(UINT width, UINT height) {
     return pixels;
 }
 
-std::vector<BYTE> load_pixels(UINT width, UINT height) {
+std::shared_ptr<const std::vector<BYTE>> load_pixels(UINT width, UINT height) {
     if (image_path.empty() || !width || !height || std::uint64_t(width) * height > (64u << 20)) return {};
+    {
+        std::lock_guard lock(cache_mutex);
+        if (cache.pixels && cache.width == width && cache.height == height) return cache.pixels;
+    }
     const HRESULT apartment = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
     if (FAILED(apartment) && apartment != RPC_E_CHANGED_MODE) return {};
     std::vector<BYTE> pixels;
@@ -91,13 +117,23 @@ std::vector<BYTE> load_pixels(UINT width, UINT height) {
         // Optional startup art must leave the first title frame available on low-memory hosts.
     }
     if (SUCCEEDED(apartment)) CoUninitialize();
-    return pixels;
+    if (pixels.empty()) return {};
+    auto shared = std::make_shared<const std::vector<BYTE>>(std::move(pixels));
+    std::lock_guard lock(cache_mutex);
+    if (!cache.pixels || cache.width != width || cache.height != height) cache = {width, height, shared};
+    return cache.pixels;
 }
 
 }  // namespace
 
 void configure(const std::filesystem::path& package) {
     image_path.clear();
+    window_painted.store(false, std::memory_order_relaxed);
+    texture_made.store(false, std::memory_order_relaxed);
+    {
+        std::lock_guard lock(cache_mutex);
+        clear_cache_locked();
+    }
     wchar_t value[4]{};
     if (GetEnvironmentVariableW(L"LEONIDA_PACKAGE_SPLASH", value, 4) == 1 && value[0] == L'0') return;
     wchar_t window_mode[16]{};
@@ -110,15 +146,19 @@ void configure(const std::filesystem::path& package) {
 
 bool configured() { return !image_path.empty(); }
 
+void release_pixels() {
+    std::lock_guard lock(cache_mutex);
+    clear_cache_locked();
+}
+
 bool paint_window(HWND window) {
-    static std::atomic<bool> painted{false};
-    if (painted.load() || !configured() || !window || rt::d3d12::find_title_window(GetCurrentProcessId()) != window)
+    if (window_painted.load() || !configured() || !window || rt::d3d12::find_title_window(GetCurrentProcessId()) != window)
         return false;
     RECT client{};
-    if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0 || painted.exchange(true))
+    if (!GetClientRect(window, &client) || client.right <= 0 || client.bottom <= 0 || window_painted.exchange(true))
         return false;
     auto pixels = load_pixels(UINT(client.right), UINT(client.bottom));
-    if (pixels.empty()) return false;
+    if (!pixels || pixels->empty()) return false;
     BITMAPINFO bitmap{};
     bitmap.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bitmap.bmiHeader.biWidth = client.right;
@@ -130,15 +170,16 @@ bool paint_window(HWND window) {
     HDC dc = GetDC(window);
     if (!dc) return false;
     int lines = SetDIBitsToDevice(dc, 0, 0, client.right, client.bottom, 0, 0, 0, client.bottom,
-                                  pixels.data(), &bitmap, DIB_RGB_COLORS);
+                                  pixels->data(), &bitmap, DIB_RGB_COLORS);
     ReleaseDC(window, dc);
+    maybe_release_cache();
     return lines > 0;
 }
 
 ID3D12Resource* create_texture(ID3D12Device* device, UINT width, UINT height) {
     if (!device) return nullptr;
     const auto pixels = load_pixels(width, height);
-    if (pixels.empty()) return nullptr;
+    if (!pixels || pixels->empty()) return nullptr;
     const UINT pitch = width * 4;
     const UINT bytes = pitch * height;
     D3D12_RESOURCE_DESC desc{};
@@ -152,8 +193,10 @@ ID3D12Resource* create_texture(ID3D12Device* device, UINT width, UINT height) {
     ComPtr<ID3D12Resource> texture;
     if (FAILED(device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON,
                                                nullptr, IID_PPV_ARGS(&texture))) ||
-        FAILED(texture->WriteToSubresource(0, nullptr, pixels.data(), pitch, bytes)))
+        FAILED(texture->WriteToSubresource(0, nullptr, pixels->data(), pitch, bytes)))
         return nullptr;
+    texture_made.store(true, std::memory_order_relaxed);
+    maybe_release_cache();
     return texture.Detach();
 }
 }  // namespace rt::package_splash

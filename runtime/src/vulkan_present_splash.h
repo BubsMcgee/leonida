@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vulkan_present.h"
+#include "working_set.h"
 
 namespace leonida {
 
@@ -58,6 +59,7 @@ inline VkResult VulkanPresenter::finish_startup_frame(Frame& frame, std::uint32_
                 break;
             }
     }
+    if (show_title) trim_working_set_after_startup();
     VkSubmitInfo ready{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     ready.signalSemaphoreCount = 1;
     ready.pSignalSemaphores = &ready_[image];
