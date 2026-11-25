@@ -56,6 +56,7 @@
 #include "../src/spirv_words.h"
 #include "../src/subgroup_size.h"
 #include "../src/vulkan_bindless.h"
+#include "../src/vulkan_index_view.h"
 
 #include <algorithm>
 #include <array>
@@ -1144,6 +1145,48 @@ int main(int argc, char** argv) {
     link(&f12, reinterpret_cast<VkBaseOutStructure*>(&f12), nullptr, true);
     link(&f13, reinterpret_cast<VkBaseOutStructure*>(&f13), nullptr, true);
     const bool ext_mesh = link(&mesh, reinterpret_cast<VkBaseOutStructure*>(&mesh), VK_EXT_MESH_SHADER_EXTENSION_NAME, true);
+    // VK_EXT_robustness2 and robustBufferAccess as the runtime's device chooses them (create_vulkan_device_standalone):
+    // nullDescriptor wherever it is offered, and robustBufferAccess with robustBufferAccess2 for bounded indexed
+    // indirect draws (leonida::can_enable_robust_index_view, with maintenance5). A driver makes robust buffer access part
+    // of a pipeline's cache key (AMD does), so the cache only hits in gta6rt when this device chooses the same.
+    // (The runtime also enables maintenance5 for A8 render targets alone; that is not mirrored, as before.)
+    VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    bool null_descriptor = false, robust_index_view = false;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    VkPhysicalDeviceMaintenance5FeaturesKHR maintenance5{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MAINTENANCE_5_FEATURES_KHR};
+#endif
+    if (has(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME)) {
+        VkPhysicalDeviceVulkan12Features q12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+        robustness2.pNext = &q12;
+        bool sized_indirect = false;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        if (has(VK_KHR_MAINTENANCE_5_EXTENSION_NAME)) q12.pNext = &maintenance5;
+#endif
+        VkPhysicalDeviceFeatures2 query{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
+        vkGetPhysicalDeviceFeatures2(pd, &query);
+        null_descriptor = robustness2.nullDescriptor == VK_TRUE;
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+        // The runtime only decides this where the SDK has maintenance5, as here.
+        sized_indirect = query.features.drawIndirectFirstInstance && maintenance5.maintenance5;
+        robust_index_view = leonida::can_enable_robust_index_view(
+            pd, vkGetPhysicalDeviceProperties2, sized_indirect,
+            query.features.robustBufferAccess && robustness2.robustBufferAccess2,
+            // The runtime passes its bindless choice (storage-buffer update-after-bind); this device enables every
+            // supported update-after-bind feature, so any buffer one asks for the property (VUID-...-robustBufferAccess-10247).
+            q12.descriptorBindingUniformBufferUpdateAfterBind || q12.descriptorBindingStorageBufferUpdateAfterBind ||
+                q12.descriptorBindingUniformTexelBufferUpdateAfterBind ||
+                q12.descriptorBindingStorageTexelBufferUpdateAfterBind);
+        maintenance5.pNext = nullptr;
+#endif
+        (void)sized_indirect;
+        robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
+    }
+    if (null_descriptor || robust_index_view)
+        link(&robustness2, reinterpret_cast<VkBaseOutStructure*>(&robustness2), VK_EXT_ROBUSTNESS_2_EXTENSION_NAME, true);
+#ifdef VK_KHR_MAINTENANCE_5_EXTENSION_NAME
+    if (robust_index_view)
+        link(&maintenance5, reinterpret_cast<VkBaseOutStructure*>(&maintenance5), VK_KHR_MAINTENANCE_5_EXTENSION_NAME, true);
+#endif
     const bool ext_bary = link(&bary, reinterpret_cast<VkBaseOutStructure*>(&bary), VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, want_bary);
     const bool ext_lock = link(&lock, reinterpret_cast<VkBaseOutStructure*>(&lock), VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, want_lock);
 #ifdef VK_KHR_MAINTENANCE_8_EXTENSION_NAME
@@ -1176,12 +1219,17 @@ int main(int argc, char** argv) {
     VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
     f2.pNext = chain;
     vkGetPhysicalDeviceFeatures2(pd, &f2);            // fills every linked struct with what's supported
-    // The runtime's device (create_vulkan_device_standalone) never enables the first two, and a driver makes them part
-    // of a pipeline's cache key: with either of them on here, the cache this tool saves does not hit in gta6rt
-    // (pipeline_cache_seed_test; docs/pipeline_check.md, "The cache and the runtime's device"). The runtime enables
-    // robustImageAccess where supported (for 1D and 3D storage views), so its queried value is kept.
-    f2.features.robustBufferAccess = VK_FALSE;
+    // A driver makes these part of a pipeline's cache key, so they must be what the runtime's device
+    // (create_vulkan_device_standalone) enables, or the cache this tool saves does not hit in gta6rt
+    // (pipeline_cache_seed_test; docs/pipeline_check.md, "The cache and the runtime's device"). The runtime never enables
+    // scalarBlockLayout, and enables robustBufferAccess (and robustBufferAccess2) only for the robust index view chosen
+    // above. It enables robustImageAccess where supported (for 1D and 3D storage views), so its queried value is kept.
+    f2.features.robustBufferAccess = robust_index_view ? VK_TRUE : VK_FALSE;
     f12.scalarBlockLayout = VK_FALSE;
+    // The query above filled the linked robustness2 struct with what is supported; keep only the runtime's choice.
+    robustness2.nullDescriptor = null_descriptor ? VK_TRUE : VK_FALSE;
+    robustness2.robustBufferAccess2 = robust_index_view ? VK_TRUE : VK_FALSE;
+    robustness2.robustImageAccess2 = VK_FALSE;
     VkPhysicalDeviceMeshShaderPropertiesEXT mesh_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MESH_SHADER_PROPERTIES_EXT};
     if (ext_mesh && mesh.meshShader) {
         VkPhysicalDeviceProperties2 mesh_device_props{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
